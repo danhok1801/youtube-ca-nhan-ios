@@ -591,8 +591,11 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
           let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
     else { return [] }
     return rows.compactMap { r in
-      guard let seg = r["segment"] as? [Double], seg.count == 2, seg[1] - seg[0] >= 1.0 else { return nil }
-      return ["start": seg[0], "end": seg[1], "category": r["category"] as? String ?? "sponsor"]
+      guard let nums = r["segment"] as? [NSNumber], nums.count == 2 else { return nil }
+      let s0 = nums[0].doubleValue
+      let s1 = nums[1].doubleValue
+      guard s1 - s0 >= 1.0 else { return nil }
+      return ["start": s0, "end": s1, "category": r["category"] as? String ?? "sponsor"]
     }
   }
 

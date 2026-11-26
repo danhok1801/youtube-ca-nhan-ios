@@ -1,8 +1,8 @@
-const CACHE_NAME = 'yt-personal-v7';
+const CACHE_NAME = 'yt-personal-v8';
 const SHELL = [
   '/',
-  '/static/styles.css?v=7',
-  '/static/app.js',
+  '/static/styles.css?v=8',
+  '/static/app.js?v=8',
   '/static/icons/icon-192.png',
   '/apple-touch-icon.png'
 ];

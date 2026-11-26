@@ -302,12 +302,6 @@ button {
   padding-top: var(--topbar-h);
 }
 
-.main-content.shorts-mode {
-  padding: 0;
-  height: 100dvh;
-  overflow: hidden;
-}
-
 /* Video Feed & Cards — Tuned for 414pt 6.5" Super Retina XDR */
 .video-feed {
   display: grid;
@@ -1236,89 +1230,6 @@ button {
   color: var(--muted);
 }
 
-/* Shorts Fullscreen Vertical Feed — Calibrated for 6.5" 896pt height */
-.shorts-container {
-  height: calc(100dvh - var(--nav-h));
-  overflow-y: scroll;
-  -webkit-overflow-scrolling: touch;
-  scroll-snap-type: y mandatory;
-  scrollbar-width: none;
-  background: var(--oled);
-}
-
-.shorts-container::-webkit-scrollbar {
-  display: none;
-}
-
-.short-slide {
-  position: relative;
-  height: calc(100dvh - var(--nav-h));
-  width: 100%;
-  scroll-snap-align: start;
-  scroll-snap-stop: always;
-  background: var(--oled);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  overflow: hidden;
-}
-
-.short-slide video,
-.short-slide .short-poster {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
-
-.short-overlay {
-  position: absolute;
-  left: 14px;
-  right: 76px;
-  bottom: 22px;
-  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.9);
-  pointer-events: none;
-}
-
-.short-channel {
-  font-size: 15px;
-  font-weight: 700;
-  margin-bottom: 6px;
-}
-
-.short-title {
-  font-size: 14.5px;
-  line-height: 1.35;
-}
-
-.short-side-actions {
-  position: absolute;
-  right: 12px;
-  bottom: 26px;
-  display: flex;
-  flex-direction: column;
-  gap: 18px;
-  align-items: center;
-}
-
-.short-act-btn {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 4px;
-  font-size: 12px;
-}
-
-.short-act-circle {
-  width: 46px;
-  height: 46px;
-  border-radius: 50%;
-  background: rgba(24, 24, 24, 0.78);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 19px;
-}
-
 /* Subscriptions & You (Library) & Channel */
 .subs-strip {
   display: flex;
@@ -1523,7 +1434,7 @@ button {
   background: var(--bg);
   border-top: 0.5px solid rgba(255, 255, 255, 0.1);
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(3, 1fr);
   z-index: 50;
   transform: translateZ(0);
 }

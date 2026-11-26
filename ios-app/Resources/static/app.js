@@ -418,9 +418,6 @@
   function playVideo(item, opts = {}) {
     if (!item || !item.id) return;
 
-    // Pause Shorts video if active
-    stopShortsPlayback();
-
     if (state.current && state.current.id !== item.id && !opts.fromPrev) {
       state.playStack.push(state.current);
       if (state.playStack.length > 40) state.playStack.shift();
@@ -641,11 +638,44 @@
     slaveVideo.pause();
   });
 
+  masterAudio.addEventListener('seeked', () => {
+    playerSpinner.classList.add('hidden');
+    if (!state.audioOnly && !document.hidden && !watchSheet.classList.contains('minimized')) {
+      const cur = masterAudio.currentTime || 0;
+      if (slaveVideo.readyState >= 1 && Math.abs(slaveVideo.currentTime - cur) > 0.35) {
+        try { slaveVideo.currentTime = cur; } catch (_) {}
+      }
+      if (!masterAudio.paused) {
+        slaveVideo.play().catch(() => {});
+      }
+    }
+    updatePositionState();
+  });
+
+  masterAudio.addEventListener('canplay', () => {
+    if (!masterAudio.paused && !masterAudio.seeking) {
+      playerSpinner.classList.add('hidden');
+      if (!state.audioOnly && !document.hidden && !watchSheet.classList.contains('minimized') && slaveVideo.paused) {
+        slaveVideo.play().catch(() => {});
+      }
+    }
+  });
+
   masterAudio.addEventListener('error', () => {
     if (!state.current) return;
     if (window.__NATIVE_IOS__ && masterAudio.dataset.proxyTried !== '1') {
+      const resumePos = Number.isFinite(masterAudio.currentTime) ? masterAudio.currentTime : 0;
       masterAudio.dataset.proxyTried = '1';
       masterAudio.src = streamUrl(state.current.id, 'audio', state.quality, true);
+      if (resumePos > 1) {
+        masterAudio.addEventListener(
+          'loadedmetadata',
+          () => {
+            try { masterAudio.currentTime = resumePos; } catch (_) {}
+          },
+          { once: true }
+        );
+      }
       masterAudio.play().catch(() => {});
       return;
     }
@@ -657,11 +687,21 @@
   slaveVideo.addEventListener('error', () => {
     if (!state.current || state.audioOnly) return;
     if (window.__NATIVE_IOS__ && slaveVideo.dataset.proxyTried !== '1') {
+      const resumePos = Number.isFinite(masterAudio.currentTime) ? masterAudio.currentTime : 0;
       slaveVideo.dataset.proxyTried = '1';
       const proxySrc = streamUrl(state.current.id, 'video', state.quality, true);
       slaveVideo.setAttribute('data-src', proxySrc);
       slaveVideo.src = proxySrc;
-      slaveVideo.play().catch(() => {});
+      if (resumePos > 1) {
+        slaveVideo.addEventListener(
+          'loadedmetadata',
+          () => {
+            try { slaveVideo.currentTime = resumePos; } catch (_) {}
+          },
+          { once: true }
+        );
+      }
+      if (!masterAudio.paused) slaveVideo.play().catch(() => {});
     }
   });
 
@@ -708,11 +748,13 @@
       progressBuffer.style.width = `${Math.min(100, (bufEnd / dur) * 100)}%`;
     }
 
-    // Soft lip-sync drift correction when video is visible
+    // Soft lip-sync drift correction when video is visible (never interrupt active seeks)
     if (
       !document.hidden &&
       !state.audioOnly &&
       !masterAudio.paused &&
+      !masterAudio.seeking &&
+      !slaveVideo.seeking &&
       !watchSheet.classList.contains('minimized') &&
       slaveVideo.readyState >= 2
     ) {
@@ -814,9 +856,13 @@
   function seekToSeconds(sec) {
     const dur = masterAudio.duration || (state.current && state.current.durationSeconds) || 0;
     const clamped = dur > 0 ? Math.max(0, Math.min(dur, sec)) : Math.max(0, sec);
+    const shouldPlay = !masterAudio.paused;
     try { masterAudio.currentTime = clamped; } catch (_) {}
-    if (!state.audioOnly && !document.hidden) {
+    if (!state.audioOnly && !document.hidden && slaveVideo.readyState >= 1) {
       try { slaveVideo.currentTime = clamped; } catch (_) {}
+    }
+    if (shouldPlay) {
+      masterAudio.play().catch(() => {});
     }
     updatePositionState();
   }
@@ -945,12 +991,22 @@
     timeDisplay.textContent = `${fmtTime(target)} / ${fmtTime(dur)}`;
   });
 
+  function commitSliderSeek() {
+    if (!state.isScrubbing) return;
+    const dur = masterAudio.duration || (state.current && state.current.durationSeconds) || 0;
+    const target = (Number(seekSlider.value) / 1000) * dur;
+    state.isScrubbing = false;
+    seekToSeconds(target);
+  }
+
   seekSlider.addEventListener('change', () => {
     const dur = masterAudio.duration || (state.current && state.current.durationSeconds) || 0;
     const target = (Number(seekSlider.value) / 1000) * dur;
     state.isScrubbing = false;
     seekToSeconds(target);
   });
+  seekSlider.addEventListener('touchend', commitSliderSeek, { passive: true });
+  seekSlider.addEventListener('touchcancel', commitSliderSeek, { passive: true });
 
   $('fullscreen-btn').addEventListener('click', () => {
     if (state.audioOnly) {
@@ -1290,24 +1346,18 @@
   $('install-btn').addEventListener('click', openInstallGuide);
 
   // -------------------------------------------------------------------------
-  // Navigation, Home, Search, Shorts, Subscriptions & Library
+  // Navigation, Home, Search, Subscriptions & Library
   // -------------------------------------------------------------------------
 
   function switchView(viewName) {
-    const views = ['home', 'search', 'shorts', 'subs', 'you', 'channel'];
+    const views = ['home', 'search', 'subs', 'you', 'channel'];
     views.forEach((v) => {
       $(`view-${v}`).classList.toggle('hidden', v !== viewName);
     });
 
     const showChips = viewName === 'home';
     chipsBar.classList.toggle('hidden', !showChips);
-    $('topbar').classList.toggle('hidden', viewName === 'shorts');
-    mainContent.classList.toggle('no-chips', !showChips && viewName !== 'shorts');
-    mainContent.classList.toggle('shorts-mode', viewName === 'shorts');
-
-    if (viewName !== 'shorts') {
-      stopShortsPlayback();
-    }
+    mainContent.classList.toggle('no-chips', !showChips);
 
     document.querySelectorAll('.nav-tab').forEach((btn) => {
       btn.classList.toggle('active', btn.dataset.tab === viewName);
@@ -1320,7 +1370,6 @@
       state.tab = tab;
       switchView(tab);
       if (tab === 'home' && !$('home-feed').children.length) loadHome(state.category);
-      if (tab === 'shorts') loadShorts();
       if (tab === 'subs') renderSubscriptionsView();
       if (tab === 'you') renderYouView();
     });
@@ -1472,132 +1521,6 @@
     } catch (_) {
       container.innerHTML = `<div class="empty-state">Tìm kiếm thất bại, vui lòng thử lại.</div>`;
     }
-  }
-
-  // Shorts Vertical Swipe Feed
-  let shortsObserver = null;
-  let activeShortAudio = null;
-  let activeShortVideo = null;
-
-  function stopShortsPlayback() {
-    if (activeShortAudio) {
-      activeShortAudio.pause();
-      activeShortAudio.removeAttribute('src');
-    }
-    if (activeShortVideo) {
-      activeShortVideo.pause();
-      activeShortVideo.removeAttribute('src');
-    }
-  }
-
-  async function loadShorts() {
-    const container = $('shorts-container');
-    if (!masterAudio.paused) masterAudio.pause();
-
-    if (!container.children.length) {
-      container.innerHTML = `<div class="empty-state">Đang tải Shorts...</div>`;
-      try {
-        const r = await fetch('/api/shorts');
-        const data = await r.json();
-        const items = data.items || [];
-        container.innerHTML = items
-          .map(
-            (v) => `
-            <div class="short-slide" data-vid="${esc(v.id)}" data-json="${esc(JSON.stringify(v))}">
-              <img class="short-poster" src="${esc(v.thumbnail)}" alt="" referrerpolicy="no-referrer">
-              <div class="short-overlay">
-                <div class="short-channel">@${esc(v.channel)}</div>
-                <div class="short-title">${esc(v.title)}</div>
-              </div>
-              <div class="short-side-actions">
-                <button class="short-act-btn act-bg">
-                  <span class="short-act-circle">🎧</span>
-                  <span>Phát nền</span>
-                </button>
-                <button class="short-act-btn act-like">
-                  <span class="short-act-circle">👍</span>
-                  <span>Thích</span>
-                </button>
-              </div>
-            </div>`
-          )
-          .join('');
-
-        container.querySelectorAll('.short-slide').forEach((slide) => {
-          const item = JSON.parse(slide.dataset.json);
-          slide.querySelector('.act-bg').addEventListener('click', (e) => {
-            e.stopPropagation();
-            stopShortsPlayback();
-            state.tab = 'home';
-            switchView('home');
-            playVideo(item);
-          });
-          slide.querySelector('.act-like').addEventListener('click', (e) => {
-            e.stopPropagation();
-            if (!state.profile.liked.some((x) => x.id === item.id)) {
-              state.profile.liked.unshift(item);
-              saveState(true);
-            }
-            showToast('Đã thích Short');
-          });
-        });
-      } catch (_) {
-        container.innerHTML = `<div class="empty-state">Không tải được Shorts.</div>`;
-        return;
-      }
-    }
-
-    if (!activeShortAudio) {
-      activeShortAudio = new Audio();
-      activeShortAudio.loop = true;
-    }
-
-    if (shortsObserver) shortsObserver.disconnect();
-    shortsObserver = new IntersectionObserver(
-      (entries) => {
-        entries.forEach((entry) => {
-          if (entry.isIntersecting && state.tab === 'shorts') {
-            activateShortSlide(entry.target);
-          }
-        });
-      },
-      { root: container, threshold: 0.68 }
-    );
-    container.querySelectorAll('.short-slide').forEach((s) => shortsObserver.observe(s));
-  }
-
-  function activateShortSlide(slide) {
-    stopShortsPlayback();
-    const vid = slide.dataset.vid;
-    if (!vid) return;
-
-    let vEl = slide.querySelector('video');
-    if (!vEl) {
-      vEl = document.createElement('video');
-      vEl.muted = true;
-      vEl.loop = true;
-      vEl.playsInline = true;
-      vEl.setAttribute('webkit-playsinline', '');
-      slide.prepend(vEl);
-      slide.addEventListener('click', () => {
-        if (activeShortAudio.paused) {
-          activeShortAudio.play().catch(() => {});
-          vEl.play().catch(() => {});
-        } else {
-          activeShortAudio.pause();
-          vEl.pause();
-        }
-      });
-    }
-    const poster = slide.querySelector('.short-poster');
-    activeShortVideo = vEl;
-    vEl.onplaying = () => {
-      if (poster) poster.classList.add('hidden');
-    };
-    vEl.src = streamUrl(vid, 'video', 480);
-    activeShortAudio.src = streamUrl(vid, 'audio');
-    activeShortAudio.play().catch(() => {});
-    vEl.play().catch(() => {});
   }
 
   // Channel View

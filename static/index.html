@@ -13,7 +13,7 @@
   <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png">
   <link rel="manifest" href="/manifest.webmanifest">
   <title>YouTube</title>
-  <link rel="stylesheet" href="/static/styles.css?v=7">
+  <link rel="stylesheet" href="/static/styles.css?v=8">
 </head>
 <body>
   <!-- Persistent Master Audio Element: NEVER destroyed so iOS Lock Screen keeps background session alive -->
@@ -102,10 +102,6 @@
         </button>
       </div>
       <div id="search-results" class="video-feed"></div>
-    </section>
-
-    <section id="view-shorts" class="view hidden">
-      <div id="shorts-container" class="shorts-container"></div>
     </section>
 
     <section id="view-subs" class="view hidden">
@@ -317,12 +313,6 @@
       </svg>
       <span>Trang chủ</span>
     </button>
-    <button class="nav-tab" data-tab="shorts">
-      <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor">
-        <path d="M17.77 10.32l-1.2-.5L18 9.06a3.74 3.74 0 0 0-3.5-6.62l-8 4.5a3.74 3.74 0 0 0 .23 6.64l1.2.5L6.5 14.84a3.74 3.74 0 0 0 3.5 6.62l8-4.5a3.74 3.74 0 0 0-.23-6.64ZM10 14.65v-5.3L15 12l-5 2.65Z"/>
-      </svg>
-      <span>Shorts</span>
-    </button>
     <button class="nav-tab" data-tab="subs">
       <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor">
         <path d="M10 18v-6l5 3-5 3Zm7-15H7v1h10V3Zm3 3H4v1h16V6Zm2 3H2v12h20V9ZM3 10h18v10H3V10Z"/>
@@ -337,6 +327,6 @@
     </button>
   </nav>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=8"></script>
 </body>
 </html>

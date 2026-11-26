@@ -6,6 +6,8 @@ private actor EngineStore {
   var watchCache: [String: (expires: TimeInterval, data: [String: Any])] = [:]
   var homeCache: [String: (expires: TimeInterval, items: [[String: Any]])] = [:]
   var inflightPlayer: [String: Task<[String: Any], Never>] = [:]
+  var visitorData: String = ""
+  var visitorExpires: TimeInterval = 0
 
   private var dataDir: URL {
     let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -109,6 +111,17 @@ private actor EngineStore {
   func getPendingDeviceCode() -> String? {
     pendingDevice["device_code"] as? String
   }
+
+  func getVisitorData() -> String? {
+    let now = Date().timeIntervalSince1970
+    if !visitorData.isEmpty && visitorExpires > now { return visitorData }
+    return nil
+  }
+
+  func setVisitorData(_ vd: String) {
+    visitorData = vd
+    visitorExpires = Date().timeIntervalSince1970 + 3600
+  }
 }
 
 final class YouTubeLocalEngine {
@@ -118,6 +131,7 @@ final class YouTubeLocalEngine {
   private let tvClientSecret = "SboVhoG9s0rNafixCSGGKXAT"
   private let tvScope = "http://gdata.youtube.com https://www.googleapis.com/auth/youtube-paid-content"
   private let iosUA = "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)"
+  private let visionUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15"
 
   private let categoryQueries: [String: String] = [
     "all": "xu hướng việt nam hot nhất hôm nay",
@@ -301,10 +315,10 @@ final class YouTubeLocalEngine {
     }
   }
 
-  // MARK: - Media Stream Handler (302 Direct CDN + 206 Range Proxy Fallback)
+  // MARK: - Media Stream Handler (302 Native HLS / Direct CDN + 206 Range Proxy Fallback)
 
-  private func pickVideoURL(_ p: [String: Any], desiredQ: Int) -> String? {
-    guard let map = p["directVideoUrls"] as? [String: String], !map.isEmpty else { return nil }
+  private func pickURLFromMap(_ map: [String: String]?, desiredQ: Int) -> String? {
+    guard let map, !map.isEmpty else { return nil }
     let heights = map.keys.compactMap(Int.init).sorted()
     let le = heights.filter { $0 <= desiredQ }
     let chosen = le.last ?? heights.first
@@ -322,32 +336,46 @@ final class YouTubeLocalEngine {
       return .redirect(hls)
     }
 
-    let targetURLStr: String
-    let fallbackMime: String
-    if mediaType == "video" {
-      targetURLStr = pickVideoURL(p, desiredQ: q) ?? (p["directAudioUrl"] as? String ?? "")
-      fallbackMime = "video/mp4"
-    } else {
-      targetURLStr = p["directAudioUrl"] as? String ?? ""
-      fallbackMime = "audio/mp4"
-    }
+    let directAudio = p["directAudioUrl"] as? String ?? ""
+    let directVideos = p["directVideoUrls"] as? [String: String]
+    let hlsAudio = p["hlsAudioUrl"] as? String ?? ""
+    let hlsVideos = p["hlsVideoUrls"] as? [String: String]
 
-    guard !targetURLStr.isEmpty else {
-      return .json(["detail": "Stream unavailable"], status: 404)
-    }
-
-    // Fast path: 302 redirect directly to Google VN CDN on iPhone's own IP (0 RAM, 20+ MB/s)
+    // Fast path: 302 redirect to native Apple HLS .m3u8 (instant seek, 0% 403) or direct CDN MP4
     if !forceProxy {
+      let targetURLStr: String
+      if mediaType == "video" {
+        targetURLStr = pickURLFromMap(hlsVideos, desiredQ: q)
+          ?? pickURLFromMap(directVideos, desiredQ: q)
+          ?? (!hlsAudio.isEmpty ? hlsAudio : directAudio)
+      } else {
+        targetURLStr = !hlsAudio.isEmpty ? hlsAudio : directAudio
+      }
+      guard !targetURLStr.isEmpty else {
+        return .json(["detail": "Stream unavailable"], status: 404)
+      }
       return .redirect(targetURLStr)
     }
 
-    // Proxy fallback path: RFC 7233 206 Partial Content with iOS YouTube User-Agent (max 512KB chunk)
+    // Proxy fallback path: RFC 7233 206 Partial Content on raw MP4 (never slice .m3u8)
+    let targetURLStr: String
+    let fallbackMime: String
+    if mediaType == "video" {
+      targetURLStr = pickURLFromMap(directVideos, desiredQ: q) ?? directAudio
+      fallbackMime = "video/mp4"
+    } else {
+      targetURLStr = directAudio
+      fallbackMime = "audio/mp4"
+    }
+    guard !targetURLStr.isEmpty else {
+      return .json(["detail": "Stream unavailable"], status: 404)
+    }
     guard let upstreamURL = URL(string: targetURLStr) else {
       return .json(["detail": "Bad stream URL"], status: 502)
     }
     var upReq = URLRequest(url: upstreamURL, timeoutInterval: 15.0)
     upReq.httpMethod = req.method == "HEAD" ? "HEAD" : "GET"
-    upReq.setValue(iosUA, forHTTPHeaderField: "User-Agent")
+    upReq.setValue(visionUA, forHTTPHeaderField: "User-Agent")
 
     let rangeHdr = req.headers["range"] ?? "bytes=0-524287"
     if rangeHdr.hasPrefix("bytes=") {
@@ -554,6 +582,140 @@ final class YouTubeLocalEngine {
     return items.compactMap { $0.first as? String }
   }
 
+  private func fetchVisitorData() async -> String {
+    if let cached = await store.getVisitorData() {
+      return cached
+    }
+    let res = await postJSON(
+      "https://www.youtube.com/youtubei/v1/visitor_id?prettyPrint=false",
+      body: [
+        "context": [
+          "client": [
+            "clientName": "VISIONOS",
+            "clientVersion": "1.02",
+            "deviceMake": "Apple",
+            "deviceModel": "RealityDevice17,1",
+            "osName": "visionOS",
+            "osVersion": "26.5.23O471",
+            "hl": "vi",
+            "gl": "VN"
+          ]
+        ]
+      ],
+      headers: [
+        "User-Agent": visionUA,
+        "X-YouTube-Client-Name": "101",
+        "X-YouTube-Client-Version": "1.02"
+      ],
+      timeout: 8.0
+    )
+    let vd = ((res["responseContext"] as? [String: Any])?["visitorData"] as? String) ?? ""
+    if !vd.isEmpty {
+      await store.setVisitorData(vd)
+    }
+    return vd
+  }
+
+  private func queryPlayerVisionOS(videoId: String) async -> [String: Any] {
+    let vd = await fetchVisitorData()
+    var client: [String: Any] = [
+      "clientName": "VISIONOS",
+      "clientVersion": "1.02",
+      "deviceMake": "Apple",
+      "deviceModel": "RealityDevice17,1",
+      "osName": "visionOS",
+      "osVersion": "26.5.23O471",
+      "hl": "vi",
+      "gl": "VN"
+    ]
+    var hdrs: [String: String] = [
+      "User-Agent": visionUA,
+      "X-YouTube-Client-Name": "101",
+      "X-YouTube-Client-Version": "1.02"
+    ]
+    if !vd.isEmpty {
+      client["visitorData"] = vd
+      hdrs["X-Goog-Visitor-Id"] = vd
+    }
+    return await postJSON(
+      "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+      body: [
+        "videoId": videoId,
+        "context": ["client": client],
+        "contentCheckOk": true,
+        "racyCheckOk": true
+      ],
+      headers: hdrs
+    )
+  }
+
+  private func extractQuotedAttr(_ line: String, key: String) -> String? {
+    let token = "\(key)=\""
+    guard let start = line.range(of: token)?.upperBound else { return nil }
+    guard let end = line[start...].firstIndex(of: "\"") else { return nil }
+    return String(line[start..<end])
+  }
+
+  private func parseHLSManifest(_ manifestUrl: String) async -> (audioUrl: String, videoUrls: [String: String]) {
+    guard let url = URL(string: manifestUrl) else { return ("", [:]) }
+    var req = URLRequest(url: url, timeoutInterval: 10.0)
+    req.setValue(visionUA, forHTTPHeaderField: "User-Agent")
+    guard let (data, resp) = try? await URLSession.shared.data(for: req),
+          let http = resp as? HTTPURLResponse,
+          http.statusCode == 200,
+          let text = String(data: data, encoding: .utf8)
+    else { return ("", [:]) }
+
+    let lines = text.components(separatedBy: .newlines)
+    var bestAudio = ""
+    var bestAudioScore = -1
+    var videoUrls: [String: String] = [:]
+    var videoScores: [String: Int] = [:]
+
+    var idx = 0
+    while idx < lines.count {
+      let line = lines[idx].trimmingCharacters(in: .whitespacesAndNewlines)
+      if line.hasPrefix("#EXT-X-MEDIA:") && line.contains("TYPE=AUDIO") {
+        if let uri = extractQuotedAttr(line, key: "URI"), !uri.isEmpty {
+          let gid = extractQuotedAttr(line, key: "GROUP-ID") ?? ""
+          let isDefault = line.contains("DEFAULT=YES")
+          let score = (isDefault ? 10 : 0) + (gid == "234" ? 5 : (gid == "233" ? 1 : 2))
+          if score > bestAudioScore {
+            bestAudioScore = score
+            bestAudio = uri
+          }
+        }
+      } else if line.hasPrefix("#EXT-X-STREAM-INF:") {
+        let codecs = extractQuotedAttr(line, key: "CODECS") ?? ""
+        if codecs.contains("avc1"),
+           let resStart = line.range(of: "RESOLUTION=")?.upperBound {
+          let tail = line[resStart...]
+          let resToken = tail.prefix { $0 != "," && $0 != " " }
+          let parts = resToken.split(separator: "x")
+          if parts.count == 2, let h = Int(parts[1]) {
+            var nextIdx = idx + 1
+            while nextIdx < lines.count && lines[nextIdx].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+              nextIdx += 1
+            }
+            if nextIdx < lines.count {
+              let uri = lines[nextIdx].trimmingCharacters(in: .whitespacesAndNewlines)
+              if uri.hasPrefix("http") {
+                let key = "\(h)"
+                let score = codecs.contains("mp4a.40.2") ? 2 : 1
+                if score > (videoScores[key] ?? 0) {
+                  videoScores[key] = score
+                  videoUrls[key] = uri
+                }
+              }
+            }
+          }
+        }
+      }
+      idx += 1
+    }
+    return (bestAudio, videoUrls)
+  }
+
   private func queryPlayerClient(videoId: String, useAndroidVR: Bool) async -> [String: Any] {
     if useAndroidVR {
       let ua = "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
@@ -629,8 +791,17 @@ final class YouTubeLocalEngine {
 
     let task = await store.getOrStartPlayer(videoId) { [weak self] in
       guard let self else { return [:] }
-      var pData = await self.queryPlayerClient(videoId: videoId, useAndroidVR: false)
+      // Primary: VISIONOS with its own visitorData (zero PO-token 403 on mid-video seek + native Apple HLS VOD)
+      var pData = await self.queryPlayerVisionOS(videoId: videoId)
       var parsed = self.parsePlayerStreams(pData)
+      if parsed.audioUrl.isEmpty && parsed.hls == nil {
+        let iosData = await self.queryPlayerClient(videoId: videoId, useAndroidVR: false)
+        let iosParsed = self.parsePlayerStreams(iosData)
+        if !iosParsed.audioUrl.isEmpty || iosParsed.hls != nil {
+          pData = iosData
+          parsed = iosParsed
+        }
+      }
       if parsed.audioUrl.isEmpty && parsed.hls == nil {
         let vrData = await self.queryPlayerClient(videoId: videoId, useAndroidVR: true)
         let vrParsed = self.parsePlayerStreams(vrData)
@@ -641,6 +812,20 @@ final class YouTubeLocalEngine {
       }
 
       let vd = pData["videoDetails"] as? [String: Any] ?? [:]
+      let isLive = vd["isLiveContent"] as? Bool ?? false
+      var hlsAudioUrl = ""
+      var hlsVideoUrls: [String: String] = [:]
+      if !isLive, let hls = parsed.hls, !hls.isEmpty {
+        let hlsParsed = await self.parseHLSManifest(hls)
+        hlsAudioUrl = hlsParsed.audioUrl
+        hlsVideoUrls = hlsParsed.videoUrls
+      }
+
+      var mergedQ = Set(parsed.qualities)
+      for k in hlsVideoUrls.keys {
+        if let h = Int(k) { mergedQ.insert(h) }
+      }
+
       let out: [String: Any] = [
         "id": videoId,
         "title": vd["title"] as? String ?? "",
@@ -648,15 +833,17 @@ final class YouTubeLocalEngine {
         "channelId": vd["channelId"] as? String ?? "",
         "description": vd["shortDescription"] as? String ?? "",
         "durationSeconds": Int(vd["lengthSeconds"] as? String ?? "0") ?? 0,
-        "isLive": vd["isLiveContent"] as? Bool ?? false,
+        "isLive": isLive,
         "thumbnail": "https://i.ytimg.com/vi/\(videoId)/hqdefault.jpg",
-        "qualities": parsed.qualities,
+        "qualities": mergedQ.sorted(),
         "hlsUrl": parsed.hls ?? NSNull(),
+        "hlsAudioUrl": hlsAudioUrl,
+        "hlsVideoUrls": hlsVideoUrls,
         "directAudioUrl": parsed.audioUrl,
         "directVideoUrls": parsed.videoUrls
       ]
 
-      if !parsed.audioUrl.isEmpty || parsed.hls != nil {
+      if !hlsAudioUrl.isEmpty || !parsed.audioUrl.isEmpty || parsed.hls != nil {
         await self.store.setPlayer(videoId, data: out)
       }
       return out

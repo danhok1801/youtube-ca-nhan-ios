@@ -2,9 +2,10 @@ import SafariServices
 import UIKit
 import WebKit
 
-final class ViewController: UIViewController, WKUIDelegate, WKNavigationDelegate, WKScriptMessageHandler {
+final class ViewController: UIViewController, WKUIDelegate, WKNavigationDelegate {
   private var webView: WKWebView!
   private let engine = YouTubeLocalEngine()
+  private var server: LocalHTTPServer!
 
   override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
 
@@ -17,7 +18,6 @@ final class ViewController: UIViewController, WKUIDelegate, WKNavigationDelegate
     cfg.allowsInlineMediaPlayback = true
     cfg.allowsPictureInPictureMediaPlayback = true
     cfg.mediaTypesRequiringUserActionForPlayback = []
-    cfg.setURLSchemeHandler(engine, forURLScheme: "ytlocal")
 
     let inject = WKUserScript(
       source: "window.__NATIVE_IOS__ = true;",
@@ -25,7 +25,6 @@ final class ViewController: UIViewController, WKUIDelegate, WKNavigationDelegate
       forMainFrameOnly: true
     )
     cfg.userContentController.addUserScript(inject)
-    cfg.userContentController.add(self, name: "nativeSaveProfile")
 
     webView = WKWebView(frame: view.bounds, configuration: cfg)
     webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -37,15 +36,25 @@ final class ViewController: UIViewController, WKUIDelegate, WKNavigationDelegate
     webView.navigationDelegate = self
     view.addSubview(webView)
 
-    if let startURL = URL(string: "ytlocal://app/index.html") {
-      webView.load(URLRequest(url: startURL))
+    server = LocalHTTPServer { [weak self] req in
+      guard let self else { return LocalHTTPResponse.json(["detail": "stopped"], status: 500) }
+      return await self.engine.handleHTTP(req)
     }
+    server.start { [weak self] port in
+      guard let self, let url = URL(string: "http://127.0.0.1:\(port)/") else { return }
+      self.webView.load(URLRequest(url: url))
+    }
+
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(onForeground),
+      name: UIApplication.willEnterForegroundNotification,
+      object: nil
+    )
   }
 
-  func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-    if message.name == "nativeSaveProfile", let dict = message.body as? [String: Any] {
-      engine.saveProfileFromBridge(dict)
-    }
+  @objc private func onForeground() {
+    server?.ensureRunning()
   }
 
   func webView(

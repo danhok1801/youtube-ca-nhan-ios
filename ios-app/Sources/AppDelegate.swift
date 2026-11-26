@@ -27,11 +27,9 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
   private func configureBackgroundAudioSession() {
     let session = AVAudioSession.sharedInstance()
-    try? session.setCategory(
-      .playback,
-      mode: .default,
-      options: [.allowAirPlay, .allowBluetoothA2DP]
-    )
+    // For .playback, AirPlay & Bluetooth A2DP are enabled by default;
+    // passing .allowAirPlay/.allowBluetoothA2DP throws OSStatus -50 on iOS.
+    try? session.setCategory(.playback, mode: .default, options: [])
     try? session.setActive(true)
   }
 

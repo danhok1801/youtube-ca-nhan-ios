@@ -93,10 +93,6 @@
     if (syncRemote) {
       clearTimeout(syncTimeout);
       syncTimeout = setTimeout(() => {
-        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.nativeSaveProfile) {
-          try { window.webkit.messageHandlers.nativeSaveProfile.postMessage(state.profile); } catch (_) {}
-          return;
-        }
         fetch('/api/profile', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -276,23 +272,11 @@
   // Core Lock-Screen Background Audio + Synced Video Engine
   // -------------------------------------------------------------------------
 
-  function streamUrl(videoId, type, quality) {
-    if (window.__NATIVE_IOS__ && state.current && state.current.id === videoId) {
-      if (type === 'audio' && state.current.directAudioUrl) {
-        return state.current.directAudioUrl;
-      }
-      if (type === 'video' && state.current.directVideoUrls) {
-        const urls = state.current.directVideoUrls;
-        const q = quality || state.quality;
-        const keys = Object.keys(urls).map(Number).sort((a, b) => a - b);
-        const le = keys.filter((k) => k <= q);
-        const pick = le.length ? le[le.length - 1] : keys[0];
-        if (pick && urls[String(pick)]) return urls[String(pick)];
-      }
-    }
+  function streamUrl(videoId, type, quality, proxy = false) {
+    const p = proxy ? '&proxy=1' : '';
     return type === 'audio'
-      ? `/api/stream/${encodeURIComponent(videoId)}?type=audio`
-      : `/api/stream/${encodeURIComponent(videoId)}?type=video&q=${quality || state.quality}`;
+      ? `/api/stream/${encodeURIComponent(videoId)}?type=audio${p}`
+      : `/api/stream/${encodeURIComponent(videoId)}?type=video&q=${quality || state.quality}${p}`;
   }
 
   function updatePlayIcons(playing) {
@@ -478,26 +462,26 @@
     // 1. CRITICAL FOR iOS: Start masterAudio synchronously inside user gesture / ended tick!
     playerSpinner.classList.remove('hidden');
     masterAudio.playbackRate = state.playbackRate;
-    if (!window.__NATIVE_IOS__) {
-      masterAudio.src = streamUrl(item.id, 'audio');
-      if (resumeAt > 0) {
-        masterAudio.addEventListener(
-          'loadedmetadata',
-          () => {
-            try { masterAudio.currentTime = resumeAt; } catch (_) {}
-          },
-          { once: true }
-        );
-      }
-      masterAudio.play().catch(() => {
-        updatePlayIcons(false);
-        playerSpinner.classList.add('hidden');
-      });
+    masterAudio.dataset.proxyTried = '0';
+    masterAudio.src = streamUrl(item.id, 'audio');
+    if (resumeAt > 0) {
+      masterAudio.addEventListener(
+        'loadedmetadata',
+        () => {
+          try { masterAudio.currentTime = resumeAt; } catch (_) {}
+        },
+        { once: true }
+      );
     }
+    masterAudio.play().catch(() => {
+      updatePlayIcons(false);
+      playerSpinner.classList.add('hidden');
+    });
 
     // 2. Attach synced muted H.264 video when visible and not in Audio-Only mode
+    slaveVideo.dataset.proxyTried = '0';
     updateAudioModeUI();
-    if (!window.__NATIVE_IOS__ && !state.audioOnly && !document.hidden && !watchSheet.classList.contains('minimized')) {
+    if (!state.audioOnly && !document.hidden && !watchSheet.classList.contains('minimized')) {
       attachAndSyncVideo(true);
     }
 
@@ -507,62 +491,22 @@
     showControlsTemporarily();
     recordHistory(state.current, resumeAt);
 
-    // 4. Start stream immediately via /api/player (fast ~180ms) in Native iOS, while /api/watch loads Up Next & SponsorBlock in parallel
+    // 4. Fetch watch metadata, Up Next & SponsorBlock in parallel
     const activeId = item.id;
-    let startedPlayback = false;
-    const applyStreamDetail = (detail) => {
-      if (!state.current || state.current.id !== activeId) return;
-      state.current = { ...state.current, ...detail };
-      if (Array.isArray(detail.qualities) && detail.qualities.length) {
-        state.qualities = detail.qualities;
-        const avail = detail.qualities.filter((q) => q <= state.quality);
-        const actualQ = avail.length ? avail[avail.length - 1] : detail.qualities[0];
-        $('quality-btn').textContent = `${actualQ}p`;
-      }
-      if (window.__NATIVE_IOS__ && !startedPlayback) {
-        const chosenAudio = detail.isLive && detail.hlsUrl ? detail.hlsUrl : detail.directAudioUrl;
-        if (!chosenAudio) return;
-        startedPlayback = true;
-        masterAudio.src = chosenAudio;
-        masterAudio.load();
-        if (resumeAt > 0) {
-          masterAudio.addEventListener(
-            'loadedmetadata',
-            () => {
-              try { masterAudio.currentTime = resumeAt; } catch (_) {}
-            },
-            { once: true }
-          );
-        }
-        masterAudio.play().catch(() => {
-          updatePlayIcons(false);
-          playerSpinner.classList.add('hidden');
-        });
-        if (!state.audioOnly && !document.hidden && !watchSheet.classList.contains('minimized')) {
-          attachAndSyncVideo(true);
-        }
-      }
-    };
-
-    if (window.__NATIVE_IOS__) {
-      fetch(`/api/player/${encodeURIComponent(activeId)}`)
-        .then((r) => (r.ok ? r.json() : Promise.reject(new Error('player failed'))))
-        .then((pDetail) => applyStreamDetail(pDetail))
-        .catch(() => {});
-    }
-
     fetch(`/api/watch/${encodeURIComponent(activeId)}`)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error('watch failed'))))
       .then((detail) => {
         if (!state.current || state.current.id !== activeId) return;
-        applyStreamDetail(detail);
+        state.current = { ...state.current, ...detail };
+        if (Array.isArray(detail.qualities) && detail.qualities.length) {
+          state.qualities = detail.qualities;
+          const avail = detail.qualities.filter((q) => q <= state.quality);
+          const actualQ = avail.length ? avail[avail.length - 1] : detail.qualities[0];
+          $('quality-btn').textContent = `${actualQ}p`;
+        }
         state.related = detail.related || [];
 
-        if (window.__NATIVE_IOS__ && !startedPlayback) {
-          playerSpinner.classList.add('hidden');
-          updatePlayIcons(false);
-          showToast('Không lấy được luồng phát, hãy thử lại');
-        } else if (!window.__NATIVE_IOS__ && detail.isLive && detail.hlsUrl && masterAudio.error) {
+        if (detail.isLive && detail.hlsUrl && masterAudio.error) {
           masterAudio.src = detail.hlsUrl;
           masterAudio.play().catch(() => {});
         }
@@ -573,13 +517,7 @@
         updateMediaSession();
         recordHistory(state.current, masterAudio.currentTime || 0);
       })
-      .catch(() => {
-        if (window.__NATIVE_IOS__ && !startedPlayback) {
-          playerSpinner.classList.add('hidden');
-          updatePlayIcons(false);
-          showToast('Lỗi tải dữ liệu video, hãy thử lại');
-        }
-      });
+      .catch(() => {});
   }
 
   function renderSponsorMarkers() {
@@ -701,6 +639,30 @@
   masterAudio.addEventListener('waiting', () => {
     playerSpinner.classList.remove('hidden');
     slaveVideo.pause();
+  });
+
+  masterAudio.addEventListener('error', () => {
+    if (!state.current) return;
+    if (window.__NATIVE_IOS__ && masterAudio.dataset.proxyTried !== '1') {
+      masterAudio.dataset.proxyTried = '1';
+      masterAudio.src = streamUrl(state.current.id, 'audio', state.quality, true);
+      masterAudio.play().catch(() => {});
+      return;
+    }
+    playerSpinner.classList.add('hidden');
+    updatePlayIcons(false);
+    showToast('Không phát được luồng âm thanh, bấm Phát để thử lại');
+  });
+
+  slaveVideo.addEventListener('error', () => {
+    if (!state.current || state.audioOnly) return;
+    if (window.__NATIVE_IOS__ && slaveVideo.dataset.proxyTried !== '1') {
+      slaveVideo.dataset.proxyTried = '1';
+      const proxySrc = streamUrl(state.current.id, 'video', state.quality, true);
+      slaveVideo.setAttribute('data-src', proxySrc);
+      slaveVideo.src = proxySrc;
+      slaveVideo.play().catch(() => {});
+    }
   });
 
   masterAudio.addEventListener('ratechange', () => {
@@ -1632,25 +1594,10 @@
     vEl.onplaying = () => {
       if (poster) poster.classList.add('hidden');
     };
-
-    if (window.__NATIVE_IOS__) {
-      fetch(`/api/watch/${encodeURIComponent(vid)}`)
-        .then((r) => r.json())
-        .then((d) => {
-          if (activeShortVideo !== vEl || state.tab !== 'shorts') return;
-          const vUrls = d.directVideoUrls || {};
-          vEl.src = vUrls['480'] || vUrls['360'] || vUrls['720'] || '';
-          activeShortAudio.src = d.directAudioUrl || '';
-          activeShortAudio.play().catch(() => {});
-          vEl.play().catch(() => {});
-        })
-        .catch(() => {});
-    } else {
-      vEl.src = streamUrl(vid, 'video', 480);
-      activeShortAudio.src = streamUrl(vid, 'audio');
-      activeShortAudio.play().catch(() => {});
-      vEl.play().catch(() => {});
-    }
+    vEl.src = streamUrl(vid, 'video', 480);
+    activeShortAudio.src = streamUrl(vid, 'audio');
+    activeShortAudio.play().catch(() => {});
+    vEl.play().catch(() => {});
   }
 
   // Channel View

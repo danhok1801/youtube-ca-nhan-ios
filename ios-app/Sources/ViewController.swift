@@ -32,6 +32,8 @@ final class ViewController: UIViewController, WKUIDelegate, WKNavigationDelegate
     webView.backgroundColor = bg
     webView.scrollView.backgroundColor = bg
     webView.scrollView.contentInsetAdjustmentBehavior = .never
+    webView.scrollView.bounces = true
+    webView.scrollView.showsHorizontalScrollIndicator = false
     webView.uiDelegate = self
     webView.navigationDelegate = self
     view.addSubview(webView)
@@ -51,6 +53,32 @@ final class ViewController: UIViewController, WKUIDelegate, WKNavigationDelegate
       name: UIApplication.willEnterForegroundNotification,
       object: nil
     )
+  }
+
+  override func viewSafeAreaInsetsDidChange() {
+    super.viewSafeAreaInsetsDidChange()
+    pushSafeAreaInsets()
+  }
+
+  override func viewDidLayoutSubviews() {
+    super.viewDidLayoutSubviews()
+    pushSafeAreaInsets()
+  }
+
+  private func pushSafeAreaInsets() {
+    guard let webView else { return }
+    let s = view.safeAreaInsets
+    let js = """
+    document.documentElement.style.setProperty('--ios-safe-top', '\(Int(s.top))px');
+    document.documentElement.style.setProperty('--ios-safe-bottom', '\(Int(s.bottom))px');
+    document.documentElement.style.setProperty('--ios-safe-left', '\(Int(s.left))px');
+    document.documentElement.style.setProperty('--ios-safe-right', '\(Int(s.right))px');
+    """
+    webView.evaluateJavaScript(js, completionHandler: nil)
+  }
+
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    pushSafeAreaInsets()
   }
 
   @objc private func onForeground() {

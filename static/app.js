@@ -254,16 +254,6 @@
       const item = byId.get(vid);
       if (!item) return;
 
-      if (window.__NATIVE_IOS__) {
-        card.addEventListener(
-          'touchstart',
-          () => {
-            fetch(`/api/player/${encodeURIComponent(vid)}`).catch(() => {});
-          },
-          { passive: true, once: true }
-        );
-      }
-
       card.addEventListener('click', (e) => {
         const moreBtn = e.target.closest('.card-more-btn');
         if (moreBtn) {
@@ -530,8 +520,11 @@
         $('quality-btn').textContent = `${actualQ}p`;
       }
       if (window.__NATIVE_IOS__ && !startedPlayback) {
+        const chosenAudio = detail.isLive && detail.hlsUrl ? detail.hlsUrl : detail.directAudioUrl;
+        if (!chosenAudio) return;
         startedPlayback = true;
-        masterAudio.src = detail.isLive && detail.hlsUrl ? detail.hlsUrl : streamUrl(activeId, 'audio');
+        masterAudio.src = chosenAudio;
+        masterAudio.load();
         if (resumeAt > 0) {
           masterAudio.addEventListener(
             'loadedmetadata',
@@ -565,7 +558,11 @@
         applyStreamDetail(detail);
         state.related = detail.related || [];
 
-        if (!window.__NATIVE_IOS__ && detail.isLive && detail.hlsUrl && masterAudio.error) {
+        if (window.__NATIVE_IOS__ && !startedPlayback) {
+          playerSpinner.classList.add('hidden');
+          updatePlayIcons(false);
+          showToast('Không lấy được luồng phát, hãy thử lại');
+        } else if (!window.__NATIVE_IOS__ && detail.isLive && detail.hlsUrl && masterAudio.error) {
           masterAudio.src = detail.hlsUrl;
           masterAudio.play().catch(() => {});
         }
@@ -576,7 +573,13 @@
         updateMediaSession();
         recordHistory(state.current, masterAudio.currentTime || 0);
       })
-      .catch(() => {});
+      .catch(() => {
+        if (window.__NATIVE_IOS__ && !startedPlayback) {
+          playerSpinner.classList.add('hidden');
+          updatePlayIcons(false);
+          showToast('Lỗi tải dữ liệu video, hãy thử lại');
+        }
+      });
   }
 
   function renderSponsorMarkers() {
@@ -1368,19 +1371,23 @@
   });
 
   // Home + Category Chips
-  async function loadHome(category = 'all') {
+  async function loadHome(category = 'all', forceRefresh = false) {
     state.category = category;
     const feed = $('home-feed');
     renderSkeletons(feed, 6);
     try {
-      const r = await fetch(`/api/home?category=${encodeURIComponent(category)}`);
+      const url = `/api/home?category=${encodeURIComponent(category)}${forceRefresh ? '&refresh=1' : ''}`;
+      const r = await fetch(url);
       const data = await r.json();
-      renderVideoFeed(feed, data.items || []);
+      if (!data.items || !data.items.length) {
+        throw new Error('empty');
+      }
+      renderVideoFeed(feed, data.items);
     } catch (_) {
-      feed.innerHTML = `<div class="empty-state">Không kết nối được máy chủ. Nhấn để thử lại.</div>`;
+      feed.innerHTML = `<div class="empty-state">Không tải được video. Nhấn vào đây để thử lại.</div>`;
       feed.onclick = () => {
         feed.onclick = null;
-        loadHome(category);
+        loadHome(category, true);
       };
     }
   }

@@ -1,33 +1,99 @@
 import Foundation
 import WebKit
 
+private actor EngineStore {
+  var pendingDevice: [String: Any] = [:]
+  var playerCache: [String: (expires: TimeInterval, data: [String: Any])] = [:]
+  var watchCache: [String: (expires: TimeInterval, data: [String: Any])] = [:]
+  var homeCache: [String: (expires: TimeInterval, items: [[String: Any]])] = [:]
+
+  private var dataDir: URL {
+    let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+      .appendingPathComponent("YouTubeCaNhan", isDirectory: true)
+    try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+    return base
+  }
+
+  func readJSON(_ name: String, fallback: [String: Any]) -> [String: Any] {
+    let url = dataDir.appendingPathComponent(name)
+    guard let data = try? Data(contentsOf: url),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return fallback }
+    return obj
+  }
+
+  func writeJSON(_ name: String, dict: [String: Any]) {
+    let url = dataDir.appendingPathComponent(name)
+    if let data = try? JSONSerialization.data(withJSONObject: dict) {
+      try? data.write(to: url, options: .atomic)
+    }
+  }
+
+  func removeFile(_ name: String) {
+    try? FileManager.default.removeItem(at: dataDir.appendingPathComponent(name))
+  }
+
+  func getPlayer(_ vid: String) -> [String: Any]? {
+    let now = Date().timeIntervalSince1970
+    if let hit = playerCache[vid], hit.expires > now { return hit.data }
+    return nil
+  }
+
+  func setPlayer(_ vid: String, data: [String: Any]) {
+    playerCache[vid] = (Date().timeIntervalSince1970 + 7200, data)
+  }
+
+  func getWatch(_ vid: String) -> [String: Any]? {
+    let now = Date().timeIntervalSince1970
+    if let hit = watchCache[vid], hit.expires > now { return hit.data }
+    return nil
+  }
+
+  func setWatch(_ vid: String, data: [String: Any]) {
+    watchCache[vid] = (Date().timeIntervalSince1970 + 7200, data)
+  }
+
+  func getHome(_ cat: String) -> (items: [[String: Any]], stale: Bool)? {
+    let now = Date().timeIntervalSince1970
+    if let hit = homeCache[cat], !hit.items.isEmpty {
+      return (hit.items, hit.expires <= now)
+    }
+    if cat == "all" {
+      let disk = readJSON("home_cache.json", fallback: [:])
+      if let items = disk["items"] as? [[String: Any]], !items.isEmpty {
+        let savedAt = disk["savedAt"] as? TimeInterval ?? 0
+        homeCache["all"] = (savedAt + 240, items)
+        return (items, savedAt + 240 <= now)
+      }
+    }
+    return nil
+  }
+
+  func setHome(_ cat: String, items: [[String: Any]]) {
+    let now = Date().timeIntervalSince1970
+    homeCache[cat] = (now + 240, items)
+    if cat == "all" {
+      writeJSON("home_cache.json", dict: ["savedAt": now, "items": items])
+    }
+  }
+
+  func clearHome() {
+    homeCache.removeAll()
+    removeFile("home_cache.json")
+  }
+
+  func setPendingDevice(_ dict: [String: Any]) {
+    pendingDevice = dict
+  }
+
+  func getPendingDeviceCode() -> String? {
+    pendingDevice["device_code"] as? String
+  }
+}
+
 final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
   private var activeTasks = Set<ObjectIdentifier>()
-  private let stateLock = NSLock()
-  private var pendingDevice: [String: Any] = [:]
-  private var playerCache: [String: (expires: TimeInterval, data: [String: Any])] = [:]
-  private var watchCache: [String: (expires: TimeInterval, data: [String: Any])] = [:]
-  private var homeCache: [String: (expires: TimeInterval, items: [[String: Any]])] = [:]
-  private var inflightPlayer: [String: Task<[String: Any], Never>] = [:]
-  private var inflightHome: [String: Task<[[String: Any]], Never>] = [:]
-
-  private lazy var fastSession: URLSession = {
-    let cfg = URLSessionConfiguration.default
-    cfg.timeoutIntervalForRequest = 8.0
-    cfg.timeoutIntervalForResource = 15.0
-    cfg.httpMaximumConnectionsPerHost = 12
-    cfg.httpShouldUsePipelining = true
-    cfg.waitsForConnectivity = false
-    return URLSession(configuration: cfg)
-  }()
-
-  private lazy var sponsorSession: URLSession = {
-    let cfg = URLSessionConfiguration.ephemeral
-    cfg.timeoutIntervalForRequest = 1.8
-    cfg.timeoutIntervalForResource = 2.2
-    cfg.waitsForConnectivity = false
-    return URLSession(configuration: cfg)
-  }()
+  private let store = EngineStore()
 
   private let tvClientId = "861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleusercontent.com"
   private let tvClientSecret = "SboVhoG9s0rNafixCSGGKXAT"
@@ -52,25 +118,8 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
     "inFeedAdLayoutRenderer", "playerAds"
   ]
 
-  override init() {
-    super.init()
-    // Warm up disk cache & network connection immediately on app launch
-    Task.detached(priority: .userInitiated) { [weak self] in
-      guard let self else { return }
-      let disk = self.readJSONFile("home_cache.json", fallback: [:])
-      if let items = disk["items"] as? [[String: Any]], !items.isEmpty {
-        let savedAt = disk["savedAt"] as? TimeInterval ?? 0
-        self.stateLock.lock()
-        self.homeCache["all"] = (savedAt + 180, items)
-        self.stateLock.unlock()
-      }
-      _ = await self.fetchHomeFromNetwork(category: "all")
-    }
-  }
-
   func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
-    let taskObj = urlSchemeTask as AnyObject
-    let id = ObjectIdentifier(taskObj)
+    let id = ObjectIdentifier(urlSchemeTask as AnyObject)
     activeTasks.insert(id)
 
     let reqURL = urlSchemeTask.request.url
@@ -115,41 +164,15 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
     await finishOnMain(task: task, id: id, url: url, status: status, mime: "application/json; charset=utf-8", data: data)
   }
 
-  // MARK: - Storage Helpers
-
-  private var dataDir: URL {
-    let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-      .appendingPathComponent("YouTubeCaNhan", isDirectory: true)
-    try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
-    return base
-  }
-
-  private func readJSONFile(_ name: String, fallback: [String: Any]) -> [String: Any] {
-    stateLock.lock()
-    defer { stateLock.unlock() }
-    let url = dataDir.appendingPathComponent(name)
-    guard let data = try? Data(contentsOf: url),
-          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-    else { return fallback }
-    return obj
-  }
-
-  private func writeJSONFile(_ name: String, dict: [String: Any]) {
-    stateLock.lock()
-    defer { stateLock.unlock() }
-    let url = dataDir.appendingPathComponent(name)
-    if let data = try? JSONSerialization.data(withJSONObject: dict) {
-      try? data.write(to: url, options: .atomic)
-    }
-  }
-
   func saveProfileFromBridge(_ incoming: [String: Any]) {
-    let def: [String: Any] = ["history": [], "liked": [], "watchLater": [], "subscriptions": [], "playlists": []]
-    var cur = readJSONFile("profile.json", fallback: def)
-    for k in ["history", "liked", "watchLater", "subscriptions", "playlists"] {
-      if let arr = incoming[k] as? [Any] { cur[k] = Array(arr.prefix(300)) }
+    Task {
+      let def: [String: Any] = ["history": [], "liked": [], "watchLater": [], "subscriptions": [], "playlists": []]
+      var cur = await store.readJSON("profile.json", fallback: def)
+      for k in ["history", "liked", "watchLater", "subscriptions", "playlists"] {
+        if let arr = incoming[k] as? [Any] { cur[k] = Array(arr.prefix(300)) }
+      }
+      await store.writeJSON("profile.json", dict: cur)
     }
-    writeJSONFile("profile.json", dict: cur)
   }
 
   // MARK: - Router
@@ -178,10 +201,15 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
       let def: [String: Any] = ["history": [], "liked": [], "watchLater": [], "subscriptions": [], "playlists": []]
       if method == "POST", let b = body,
          let incoming = try? JSONSerialization.jsonObject(with: b) as? [String: Any] {
-        saveProfileFromBridge(incoming)
+        var cur = await store.readJSON("profile.json", fallback: def)
+        for k in ["history", "liked", "watchLater", "subscriptions", "playlists"] {
+          if let arr = incoming[k] as? [Any] { cur[k] = Array(arr.prefix(300)) }
+        }
+        await store.writeJSON("profile.json", dict: cur)
         await finishJSON(task: task, id: id, url: reqURL, obj: ["ok": true])
       } else {
-        await finishJSON(task: task, id: id, url: reqURL, obj: readJSONFile("profile.json", fallback: def))
+        let cur = await store.readJSON("profile.json", fallback: def)
+        await finishJSON(task: task, id: id, url: reqURL, obj: cur)
       }
 
     case "/api/suggest":
@@ -229,8 +257,7 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
       }
 
     case "/api/auth/status":
-      // Instant local auth read without blocking UI on OAuth refresh
-      let auth = readJSONFile("google_auth.json", fallback: [:])
+      let auth = await store.readJSON("google_auth.json", fallback: [:])
       let hasToken = !(auth["refresh_token"] as? String ?? "").isEmpty || !(auth["access_token"] as? String ?? "").isEmpty
       if hasToken {
         await finishJSON(task: task, id: id, url: reqURL, obj: [
@@ -258,24 +285,20 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
         pid = incoming["pageId"] as? String ?? ""
         cname = incoming["name"] as? String ?? ""
       }
-      var auth = readJSONFile("google_auth.json", fallback: [:])
+      var auth = await store.readJSON("google_auth.json", fallback: [:])
       if let accs = auth["accounts"] as? [[String: Any]],
          let match = accs.first(where: {
            ($0["pageId"] as? String ?? "") == pid && (cname.isEmpty || ($0["name"] as? String ?? "") == cname)
          }) {
         auth["account"] = match
-        writeJSONFile("google_auth.json", dict: auth)
+        await store.writeJSON("google_auth.json", dict: auth)
       }
-      stateLock.lock()
-      homeCache.removeAll()
-      stateLock.unlock()
+      await store.clearHome()
       await finishJSON(task: task, id: id, url: reqURL, obj: ["ok": true, "account": auth["account"] ?? NSNull()])
 
     case "/api/auth/logout":
-      stateLock.lock()
-      try? FileManager.default.removeItem(at: dataDir.appendingPathComponent("google_auth.json"))
-      homeCache.removeAll()
-      stateLock.unlock()
+      await store.removeFile("google_auth.json")
+      await store.clearHome()
       await finishJSON(task: task, id: id, url: reqURL, obj: ["ok": true])
 
     case "/api/account/history":
@@ -357,17 +380,17 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
     return String(raw[range])
   }
 
-  private func postJSON(_ urlStr: String, body: [String: Any], headers: [String: String] = [:]) async -> [String: Any] {
+  private func postJSON(_ urlStr: String, body: [String: Any], headers: [String: String] = [:], timeout: TimeInterval = 10.0) async -> [String: Any] {
     guard let url = URL(string: urlStr),
           let payload = try? JSONSerialization.data(withJSONObject: body)
     else { return [:] }
-    var req = URLRequest(url: url, timeoutInterval: 8.0)
+    var req = URLRequest(url: url, timeoutInterval: timeout)
     req.httpMethod = "POST"
     req.httpBody = payload
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     req.setValue("vi-VN,vi;q=0.9,en;q=0.8", forHTTPHeaderField: "Accept-Language")
     for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
-    guard let (data, _) = try? await fastSession.data(for: req),
+    guard let (data, _) = try? await URLSession.shared.data(for: req),
           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     else { return [:] }
     return obj
@@ -387,7 +410,7 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
   }
 
   private func innertubeTVAuth(_ endpoint: String, payload: [String: Any], token: String) async -> [String: Any] {
-    let auth = readJSONFile("google_auth.json", fallback: [:])
+    let auth = await store.readJSON("google_auth.json", fallback: [:])
     let pageId = (auth["account"] as? [String: Any])?["pageId"] as? String ?? ""
     var ctx: [String: Any] = [
       "client": [
@@ -408,81 +431,56 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
   }
 
   private func fetchHome(category: String, forceRefresh: Bool = false) async -> [[String: Any]] {
-    let now = Date().timeIntervalSince1970
-    stateLock.lock()
-    let cached = homeCache[category]
-    stateLock.unlock()
-
-    if !forceRefresh, let hit = cached, !hit.items.isEmpty {
-      if hit.expires <= now {
+    if !forceRefresh, let cached = await store.getHome(category) {
+      if cached.stale {
         Task.detached(priority: .utility) { [weak self] in
           _ = await self?.fetchHomeFromNetwork(category: category)
         }
       }
-      return hit.items
+      return cached.items
     }
     return await fetchHomeFromNetwork(category: category)
   }
 
   private func fetchHomeFromNetwork(category: String) async -> [[String: Any]] {
-    stateLock.lock()
-    if let running = inflightHome[category] {
-      stateLock.unlock()
-      return await running.value
+    var items: [[String: Any]] = []
+    if category == "all", let tok = await validGoogleToken(), !tok.isEmpty {
+      let tree = await innertubeTVAuth("browse", payload: ["browseId": "FEwhat_to_watch"], token: tok)
+      items = extractVideos(from: tree, limit: 30)
     }
-    let task = Task<[[String: Any]], Never> { [weak self] in
-      guard let self else { return [] }
-      var items: [[String: Any]] = []
-      if category == "all", let tok = await self.validGoogleToken(), !tok.isEmpty {
-        let tree = await self.innertubeTVAuth("browse", payload: ["browseId": "FEwhat_to_watch"], token: tok)
-        items = self.extractVideos(from: tree, limit: 30)
-      }
 
-      if items.count < 6 {
-        if category == "all" {
-          async let r1 = self.innertubeWeb("search", payload: ["query": "nhạc trẻ việt nam hot nhất 2026 mv"])
-          async let r2 = self.innertubeWeb("search", payload: ["query": "video xu hướng việt nam mới nhất hôm nay"])
-          let (t1, t2) = await (r1, r2)
-          let l1 = self.extractVideos(from: t1, limit: 16)
-          let l2 = self.extractVideos(from: t2, limit: 16)
-          var seen = Set<String>()
-          for i in 0..<max(l1.count, l2.count) {
-            if i < l1.count, let id = l1[i]["id"] as? String, seen.insert(id).inserted { items.append(l1[i]) }
-            if i < l2.count, let id = l2[i]["id"] as? String, seen.insert(id).inserted { items.append(l2[i]) }
-          }
-        } else {
-          let q = self.categoryQueries[category] ?? category
-          let tree = await self.innertubeWeb("search", payload: ["query": q])
-          items = self.extractVideos(from: tree, limit: 30)
+    if items.count < 6 {
+      if category == "all" {
+        async let r1 = innertubeWeb("search", payload: ["query": "nhạc trẻ việt nam hot nhất 2026 mv"])
+        async let r2 = innertubeWeb("search", payload: ["query": "video xu hướng việt nam mới nhất hôm nay"])
+        let (t1, t2) = await (r1, r2)
+        let l1 = extractVideos(from: t1, limit: 16)
+        let l2 = extractVideos(from: t2, limit: 16)
+        var seen = Set<String>()
+        for i in 0..<max(l1.count, l2.count) {
+          if i < l1.count, let id = l1[i]["id"] as? String, seen.insert(id).inserted { items.append(l1[i]) }
+          if i < l2.count, let id = l2[i]["id"] as? String, seen.insert(id).inserted { items.append(l2[i]) }
         }
+      } else {
+        let q = categoryQueries[category] ?? category
+        let tree = await innertubeWeb("search", payload: ["query": q])
+        items = extractVideos(from: tree, limit: 30)
       }
-
-      if !items.isEmpty {
-        let now = Date().timeIntervalSince1970
-        self.stateLock.lock()
-        self.homeCache[category] = (now + 240, items)
-        self.stateLock.unlock()
-        if category == "all" {
-          self.writeJSONFile("home_cache.json", dict: ["savedAt": now, "items": items])
-        }
-      }
-      return items
     }
-    inflightHome[category] = task
-    stateLock.unlock()
 
-    let res = await task.value
-    stateLock.lock()
-    inflightHome.removeValue(forKey: category)
-    stateLock.unlock()
-    return res
+    if !items.isEmpty {
+      await store.setHome(category, items: items)
+    }
+    return items
   }
 
   private func fetchSuggestions(_ q: String) async -> [String] {
     guard !q.isEmpty,
           let enc = q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-          let url = URL(string: "https://suggestqueries-clients6.youtube.com/complete/search?client=youtube&hl=vi&gl=VN&ds=yt&q=\(enc)"),
-          let (data, _) = try? await fastSession.data(from: url),
+          let url = URL(string: "https://suggestqueries-clients6.youtube.com/complete/search?client=youtube&hl=vi&gl=VN&ds=yt&q=\(enc)")
+    else { return [] }
+    let req = URLRequest(url: url, timeoutInterval: 5.0)
+    guard let (data, _) = try? await URLSession.shared.data(for: req),
           let text = String(data: data, encoding: .utf8),
           let s = text.firstIndex(of: "("),
           let e = text.lastIndex(of: ")")
@@ -564,70 +562,48 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
     return (audioUrl, videoUrls, qualities.sorted(), sd["hlsManifestUrl"] as? String)
   }
 
-  // Ultra-fast (~180ms) stream extraction ONLY (with single-flight deduplication)
   private func fetchPlayer(videoId: String) async -> [String: Any] {
-    let now = Date().timeIntervalSince1970
-    stateLock.lock()
-    if let hit = playerCache[videoId], hit.expires > now {
-      stateLock.unlock()
-      return hit.data
+    if let hit = await store.getPlayer(videoId) {
+      return hit
     }
-    if let running = inflightPlayer[videoId] {
-      stateLock.unlock()
-      return await running.value
-    }
-    let task = Task<[String: Any], Never> { [weak self] in
-      guard let self else { return [:] }
-      var pData = await self.queryPlayerClient(videoId: videoId, useAndroidVR: false)
-      var parsed = self.parsePlayerStreams(pData)
-      if parsed.audioUrl.isEmpty && parsed.hls == nil {
-        let vrData = await self.queryPlayerClient(videoId: videoId, useAndroidVR: true)
-        let vrParsed = self.parsePlayerStreams(vrData)
-        if !vrParsed.audioUrl.isEmpty {
-          pData = vrData
-          parsed = vrParsed
-        }
-      }
-      let vd = pData["videoDetails"] as? [String: Any] ?? [:]
-      let out: [String: Any] = [
-        "id": videoId,
-        "title": vd["title"] as? String ?? "",
-        "channel": vd["author"] as? String ?? "YouTube",
-        "channelId": vd["channelId"] as? String ?? "",
-        "description": vd["shortDescription"] as? String ?? "",
-        "durationSeconds": Int(vd["lengthSeconds"] as? String ?? "0") ?? 0,
-        "isLive": vd["isLiveContent"] as? Bool ?? false,
-        "thumbnail": "https://i.ytimg.com/vi/\(videoId)/hqdefault.jpg",
-        "qualities": parsed.qualities,
-        "hlsUrl": parsed.hls ?? NSNull(),
-        "directAudioUrl": parsed.audioUrl,
-        "directVideoUrls": parsed.videoUrls
-      ]
-      if !parsed.audioUrl.isEmpty || parsed.hls != nil {
-        self.stateLock.lock()
-        self.playerCache[videoId] = (Date().timeIntervalSince1970 + 7200, out)
-        self.stateLock.unlock()
-      }
-      return out
-    }
-    inflightPlayer[videoId] = task
-    stateLock.unlock()
 
-    let res = await task.value
-    stateLock.lock()
-    inflightPlayer.removeValue(forKey: videoId)
-    stateLock.unlock()
-    return res
+    var pData = await queryPlayerClient(videoId: videoId, useAndroidVR: false)
+    var parsed = parsePlayerStreams(pData)
+    if parsed.audioUrl.isEmpty && parsed.hls == nil {
+      let vrData = await queryPlayerClient(videoId: videoId, useAndroidVR: true)
+      let vrParsed = parsePlayerStreams(vrData)
+      if !vrParsed.audioUrl.isEmpty || vrParsed.hls != nil {
+        pData = vrData
+        parsed = vrParsed
+      }
+    }
+
+    let vd = pData["videoDetails"] as? [String: Any] ?? [:]
+    let out: [String: Any] = [
+      "id": videoId,
+      "title": vd["title"] as? String ?? "",
+      "channel": vd["author"] as? String ?? "YouTube",
+      "channelId": vd["channelId"] as? String ?? "",
+      "description": vd["shortDescription"] as? String ?? "",
+      "durationSeconds": Int(vd["lengthSeconds"] as? String ?? "0") ?? 0,
+      "isLive": vd["isLiveContent"] as? Bool ?? false,
+      "thumbnail": "https://i.ytimg.com/vi/\(videoId)/hqdefault.jpg",
+      "qualities": parsed.qualities,
+      "hlsUrl": parsed.hls ?? NSNull(),
+      "directAudioUrl": parsed.audioUrl,
+      "directVideoUrls": parsed.videoUrls
+    ]
+
+    if !parsed.audioUrl.isEmpty || parsed.hls != nil {
+      await store.setPlayer(videoId, data: out)
+    }
+    return out
   }
 
   private func fetchWatch(videoId: String) async -> [String: Any] {
-    let now = Date().timeIntervalSince1970
-    stateLock.lock()
-    if let hit = watchCache[videoId], hit.expires > now {
-      stateLock.unlock()
-      return hit.data
+    if let hit = await store.getWatch(videoId) {
+      return hit
     }
-    stateLock.unlock()
 
     async let playerReq = fetchPlayer(videoId: videoId)
     async let nextReq = innertubeWeb("next", payload: ["videoId": videoId])
@@ -672,9 +648,11 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
     out["sponsorSegments"] = segs
     out["related"] = related
 
-    stateLock.lock()
-    watchCache[videoId] = (now + 7200, out)
-    stateLock.unlock()
+    let hasAudio = !(pOut["directAudioUrl"] as? String ?? "").isEmpty
+    let hasHls = !(pOut["hlsUrl"] is NSNull) && (pOut["hlsUrl"] as? String)?.isEmpty == false
+    if hasAudio || hasHls {
+      await store.setWatch(videoId, data: out)
+    }
     return out
   }
 
@@ -706,8 +684,11 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
 
   private func fetchSponsorSegments(_ videoId: String) async -> [[String: Any]] {
     let cats = "%5B%22sponsor%22,%22selfpromo%22,%22interaction%22,%22music_offtopic%22%5D"
-    guard let url = URL(string: "https://sponsor.ajay.app/api/skipSegments?videoID=\(videoId)&categories=\(cats)"),
-          let (data, resp) = try? await sponsorSession.data(from: url),
+    guard let url = URL(string: "https://sponsor.ajay.app/api/skipSegments?videoID=\(videoId)&categories=\(cats)") else {
+      return []
+    }
+    let req = URLRequest(url: url, timeoutInterval: 2.0)
+    guard let (data, resp) = try? await URLSession.shared.data(for: req),
           (resp as? HTTPURLResponse)?.statusCode == 200,
           let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
     else { return [] }
@@ -723,7 +704,7 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
   // MARK: - Google OAuth2 Device Flow
 
   private func validGoogleToken() async -> String? {
-    var auth = readJSONFile("google_auth.json", fallback: [:])
+    var auth = await store.readJSON("google_auth.json", fallback: [:])
     let now = Date().timeIntervalSince1970
     if let tok = auth["access_token"] as? String,
        let exp = auth["expires_at"] as? Double, exp > now + 60 {
@@ -739,7 +720,7 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
     guard let newTok = r["access_token"] as? String else { return nil }
     auth["access_token"] = newTok
     auth["expires_at"] = now + Double(r["expires_in"] as? Int ?? 3500)
-    writeJSONFile("google_auth.json", dict: auth)
+    await store.writeJSON("google_auth.json", dict: auth)
     return newTok
   }
 
@@ -751,12 +732,10 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
       "device_model": "ytlr::"
     ])
     guard let dc = r["device_code"] as? String, let uc = r["user_code"] as? String else { return [:] }
-    stateLock.lock()
-    pendingDevice = [
+    await store.setPendingDevice([
       "device_code": dc,
       "expires_at": Date().timeIntervalSince1970 + Double(r["expires_in"] as? Int ?? 1800)
-    ]
-    stateLock.unlock()
+    ])
     return [
       "userCode": uc,
       "verificationUrl": r["verification_url"] as? String ?? "https://www.google.com/device",
@@ -766,10 +745,7 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
   }
 
   private func pollDeviceAuth() async -> [String: Any] {
-    stateLock.lock()
-    let dc = pendingDevice["device_code"] as? String
-    stateLock.unlock()
-    guard let code = dc else { return ["status": "expired"] }
+    guard let code = await store.getPendingDeviceCode() else { return ["status": "expired"] }
 
     let r = await postJSON("https://www.youtube.com/o/oauth2/token", body: [
       "client_id": tvClientId,
@@ -790,23 +766,21 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
       "account": ["name": "Tài khoản Google", "handle": "", "avatar": "", "pageId": ""],
       "accounts": []
     ]
-    writeJSONFile("google_auth.json", dict: baseAuth)
+    await store.writeJSON("google_auth.json", dict: baseAuth)
     let accTree = await innertubeTVAuth("account/accounts_list", payload: ["accountReadMask": ["returnOwner": true]], token: tok)
     let accounts = extractAccounts(from: accTree)
     let selected = accounts.first ?? ["name": "Tài khoản Google", "handle": "", "avatar": "", "pageId": ""]
     var finalAuth = baseAuth
     finalAuth["account"] = selected
     finalAuth["accounts"] = accounts
-    writeJSONFile("google_auth.json", dict: finalAuth)
-    stateLock.lock()
-    pendingDevice = [:]
-    homeCache.removeAll()
-    stateLock.unlock()
+    await store.writeJSON("google_auth.json", dict: finalAuth)
+    await store.setPendingDevice([:])
+    await store.clearHome()
     return ["status": "connected", "account": selected, "accounts": accounts]
   }
 
   private func fetchAccountBrowse(_ browseId: String, fallbackKey: String) async -> [String: Any] {
-    let local = (readJSONFile("profile.json", fallback: [:])[fallbackKey] as? [[String: Any]]) ?? []
+    let local = ((await store.readJSON("profile.json", fallback: [:]))[fallbackKey] as? [[String: Any]]) ?? []
     guard let tok = await validGoogleToken(), !tok.isEmpty else {
       return ["loggedIn": false, "items": local]
     }
@@ -851,7 +825,6 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
 
   private func pickFastThumb(_ sources: [[String: Any]]?, videoId: String) -> String {
     if let sources, !sources.isEmpty {
-      // Pick the ~320-480px thumbnail for crisp mobile cards without downloading 1280px images
       let chosen = sources.first(where: { ($0["width"] as? Int ?? 0) >= 320 }) ?? sources.last
       if var u = chosen?["url"] as? String, !u.isEmpty {
         if u.hasPrefix("//") { u = "https:" + u }

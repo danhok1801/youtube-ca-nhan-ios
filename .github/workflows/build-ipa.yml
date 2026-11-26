@@ -1,0 +1,56 @@
+name: Build Standalone iPhone IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+jobs:
+  build-ipa:
+    runs-on: macos-15
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Prepare Assets.xcassets (1024px AppIcon) & Web Bundle
+        run: |
+          pip3 install pillow
+          python3 ios-app/prepare_assets.py
+
+      - name: Generate Xcode project & compile unsigned Release IPA
+        run: |
+          brew install xcodegen
+          cd ios-app
+          xcodegen generate
+          xcodebuild \
+            -project YouTubeCaNhan.xcodeproj \
+            -scheme YouTubeCaNhan \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
+          rm -rf Payload YouTubeCaNhan.ipa
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/YouTubeCaNhan.app Payload/
+          zip -qry YouTubeCaNhan.ipa Payload
+
+      - name: Upload YouTubeCaNhan.ipa Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: YouTubeCaNhan-IPA
+          path: ios-app/YouTubeCaNhan.ipa
+
+      - name: Publish Direct IPA to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-ipa
+          name: "YouTube Cá Nhân iPhone (Bản độc lập .ipa)"
+          body: "Tải trực tiếp file `YouTubeCaNhan.ipa` bên dưới và cài vào iPhone bằng Sideloadly hoặc SideStore."
+          files: ios-app/YouTubeCaNhan.ipa
+          make_latest: true

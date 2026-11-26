@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.ipa
+data/
+ios-app/build/
+ios-app/Payload/
+ios-app/*.xcodeproj/

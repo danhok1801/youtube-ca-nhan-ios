@@ -5,7 +5,29 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
   private var activeTasks = Set<ObjectIdentifier>()
   private let stateLock = NSLock()
   private var pendingDevice: [String: Any] = [:]
+  private var playerCache: [String: (expires: TimeInterval, data: [String: Any])] = [:]
   private var watchCache: [String: (expires: TimeInterval, data: [String: Any])] = [:]
+  private var homeCache: [String: (expires: TimeInterval, items: [[String: Any]])] = [:]
+  private var inflightPlayer: [String: Task<[String: Any], Never>] = [:]
+  private var inflightHome: [String: Task<[[String: Any]], Never>] = [:]
+
+  private lazy var fastSession: URLSession = {
+    let cfg = URLSessionConfiguration.default
+    cfg.timeoutIntervalForRequest = 8.0
+    cfg.timeoutIntervalForResource = 15.0
+    cfg.httpMaximumConnectionsPerHost = 12
+    cfg.httpShouldUsePipelining = true
+    cfg.waitsForConnectivity = false
+    return URLSession(configuration: cfg)
+  }()
+
+  private lazy var sponsorSession: URLSession = {
+    let cfg = URLSessionConfiguration.ephemeral
+    cfg.timeoutIntervalForRequest = 1.8
+    cfg.timeoutIntervalForResource = 2.2
+    cfg.waitsForConnectivity = false
+    return URLSession(configuration: cfg)
+  }()
 
   private let tvClientId = "861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleusercontent.com"
   private let tvClientSecret = "SboVhoG9s0rNafixCSGGKXAT"
@@ -29,6 +51,22 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
     "promotedVideoRenderer", "searchPyvRenderer", "adPlacementRenderer",
     "inFeedAdLayoutRenderer", "playerAds"
   ]
+
+  override init() {
+    super.init()
+    // Warm up disk cache & network connection immediately on app launch
+    Task.detached(priority: .userInitiated) { [weak self] in
+      guard let self else { return }
+      let disk = self.readJSONFile("home_cache.json", fallback: [:])
+      if let items = disk["items"] as? [[String: Any]], !items.isEmpty {
+        let savedAt = disk["savedAt"] as? TimeInterval ?? 0
+        self.stateLock.lock()
+        self.homeCache["all"] = (savedAt + 180, items)
+        self.stateLock.unlock()
+      }
+      _ = await self.fetchHomeFromNetwork(category: "all")
+    }
+  }
 
   func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
     let taskObj = urlSchemeTask as AnyObject
@@ -100,7 +138,7 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
     stateLock.lock()
     defer { stateLock.unlock() }
     let url = dataDir.appendingPathComponent(name)
-    if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]) {
+    if let data = try? JSONSerialization.data(withJSONObject: dict) {
       try? data.write(to: url, options: .atomic)
     }
   }
@@ -153,7 +191,8 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
 
     case "/api/home":
       let cat = qItems["category"] ?? "all"
-      let items = await fetchHome(category: cat)
+      let force = qItems["refresh"] == "1"
+      let items = await fetchHome(category: cat, forceRefresh: force)
       await finishJSON(task: task, id: id, url: reqURL, obj: ["items": items, "category": cat])
 
     case "/api/shorts":
@@ -163,7 +202,7 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
     case "/api/search":
       let q = (qItems["q"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
       if let directId = parseYouTubeID(q) {
-        let w = await fetchWatch(videoId: directId)
+        let w = await fetchPlayer(videoId: directId)
         let durSec = w["durationSeconds"] as? Int ?? 0
         let durTxt = durSec > 0 ? String(format: "%d:%02d", durSec / 60, durSec % 60) : ""
         let item: [String: Any] = [
@@ -171,13 +210,13 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
           "title": w["title"] as? String ?? "YouTube Video",
           "channel": w["channel"] as? String ?? "YouTube",
           "channelId": w["channelId"] as? String ?? "",
-          "channelAvatar": w["channelAvatar"] as? String ?? "",
+          "channelAvatar": "",
           "views": "",
           "published": "",
           "duration": durTxt,
           "isLive": w["isLive"] as? Bool ?? false,
           "resumePercent": 0,
-          "thumbnail": "https://i.ytimg.com/vi/\(directId)/hq720.jpg"
+          "thumbnail": "https://i.ytimg.com/vi/\(directId)/hqdefault.jpg"
         ]
         await finishJSON(task: task, id: id, url: reqURL, obj: ["directVideoId": directId, "channels": [], "items": [item]])
       } else {
@@ -190,8 +229,10 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
       }
 
     case "/api/auth/status":
-      if let tok = await validGoogleToken(), !tok.isEmpty {
-        let auth = readJSONFile("google_auth.json", fallback: [:])
+      // Instant local auth read without blocking UI on OAuth refresh
+      let auth = readJSONFile("google_auth.json", fallback: [:])
+      let hasToken = !(auth["refresh_token"] as? String ?? "").isEmpty || !(auth["access_token"] as? String ?? "").isEmpty
+      if hasToken {
         await finishJSON(task: task, id: id, url: reqURL, obj: [
           "loggedIn": true,
           "account": auth["account"] ?? NSNull(),
@@ -225,11 +266,15 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
         auth["account"] = match
         writeJSONFile("google_auth.json", dict: auth)
       }
+      stateLock.lock()
+      homeCache.removeAll()
+      stateLock.unlock()
       await finishJSON(task: task, id: id, url: reqURL, obj: ["ok": true, "account": auth["account"] ?? NSNull()])
 
     case "/api/auth/logout":
       stateLock.lock()
       try? FileManager.default.removeItem(at: dataDir.appendingPathComponent("google_auth.json"))
+      homeCache.removeAll()
       stateLock.unlock()
       await finishJSON(task: task, id: id, url: reqURL, obj: ["ok": true])
 
@@ -246,13 +291,17 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
       await finishJSON(task: task, id: id, url: reqURL, obj: items)
 
     default:
-      if path.hasPrefix("/api/watch/") {
+      if path.hasPrefix("/api/player/") {
+        let vid = String(path.dropFirst("/api/player/".count))
+        let p = await fetchPlayer(videoId: vid)
+        await finishJSON(task: task, id: id, url: reqURL, obj: p)
+      } else if path.hasPrefix("/api/watch/") {
         let vid = String(path.dropFirst("/api/watch/".count))
         let detail = await fetchWatch(videoId: vid)
         await finishJSON(task: task, id: id, url: reqURL, obj: detail)
       } else if path.hasPrefix("/api/prefetch/") {
         let vid = String(path.dropFirst("/api/prefetch/".count))
-        _ = await fetchWatch(videoId: vid)
+        _ = await fetchPlayer(videoId: vid)
         await finishJSON(task: task, id: id, url: reqURL, obj: ["ok": true])
       } else if path.hasPrefix("/api/channel/") {
         let bid = String(path.dropFirst("/api/channel/".count))
@@ -312,13 +361,13 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
     guard let url = URL(string: urlStr),
           let payload = try? JSONSerialization.data(withJSONObject: body)
     else { return [:] }
-    var req = URLRequest(url: url, timeoutInterval: 12)
+    var req = URLRequest(url: url, timeoutInterval: 8.0)
     req.httpMethod = "POST"
     req.httpBody = payload
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     req.setValue("vi-VN,vi;q=0.9,en;q=0.8", forHTTPHeaderField: "Accept-Language")
     for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
-    guard let (data, _) = try? await URLSession.shared.data(for: req),
+    guard let (data, _) = try? await fastSession.data(for: req),
           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     else { return [:] }
     return obj
@@ -334,7 +383,7 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
         "gl": "VN"
       ]
     ]
-    return await postJSON("https://www.youtube.com/youtubei/v1/\(endpoint)", body: body)
+    return await postJSON("https://www.youtube.com/youtubei/v1/\(endpoint)?prettyPrint=false", body: body)
   }
 
   private func innertubeTVAuth(_ endpoint: String, payload: [String: Any], token: String) async -> [String: Any] {
@@ -352,42 +401,88 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
     var body = payload
     body["context"] = ctx
     return await postJSON(
-      "https://www.youtube.com/youtubei/v1/\(endpoint)",
+      "https://www.youtube.com/youtubei/v1/\(endpoint)?prettyPrint=false",
       body: body,
       headers: ["Authorization": "Bearer \(token)", "Origin": "https://www.youtube.com"]
     )
   }
 
-  private func fetchHome(category: String) async -> [[String: Any]] {
-    if category == "all", let tok = await validGoogleToken(), !tok.isEmpty {
-      let tree = await innertubeTVAuth("browse", payload: ["browseId": "FEwhat_to_watch"], token: tok)
-      let items = extractVideos(from: tree, limit: 32)
-      if items.count >= 6 { return items }
-    }
-    if category == "all" {
-      async let r1 = innertubeWeb("search", payload: ["query": "nhạc trẻ việt nam hot nhất 2026 mv"])
-      async let r2 = innertubeWeb("search", payload: ["query": "video xu hướng việt nam mới nhất hôm nay"])
-      let (t1, t2) = await (r1, r2)
-      let l1 = extractVideos(from: t1, limit: 18)
-      let l2 = extractVideos(from: t2, limit: 18)
-      var merged: [[String: Any]] = []
-      var seen = Set<String>()
-      for i in 0..<max(l1.count, l2.count) {
-        if i < l1.count, let id = l1[i]["id"] as? String, seen.insert(id).inserted { merged.append(l1[i]) }
-        if i < l2.count, let id = l2[i]["id"] as? String, seen.insert(id).inserted { merged.append(l2[i]) }
+  private func fetchHome(category: String, forceRefresh: Bool = false) async -> [[String: Any]] {
+    let now = Date().timeIntervalSince1970
+    stateLock.lock()
+    let cached = homeCache[category]
+    stateLock.unlock()
+
+    if !forceRefresh, let hit = cached, !hit.items.isEmpty {
+      if hit.expires <= now {
+        Task.detached(priority: .utility) { [weak self] in
+          _ = await self?.fetchHomeFromNetwork(category: category)
+        }
       }
-      return merged
+      return hit.items
     }
-    let q = categoryQueries[category] ?? category
-    let tree = await innertubeWeb("search", payload: ["query": q])
-    return extractVideos(from: tree, limit: 32)
+    return await fetchHomeFromNetwork(category: category)
+  }
+
+  private func fetchHomeFromNetwork(category: String) async -> [[String: Any]] {
+    stateLock.lock()
+    if let running = inflightHome[category] {
+      stateLock.unlock()
+      return await running.value
+    }
+    let task = Task<[[String: Any]], Never> { [weak self] in
+      guard let self else { return [] }
+      var items: [[String: Any]] = []
+      if category == "all", let tok = await self.validGoogleToken(), !tok.isEmpty {
+        let tree = await self.innertubeTVAuth("browse", payload: ["browseId": "FEwhat_to_watch"], token: tok)
+        items = self.extractVideos(from: tree, limit: 30)
+      }
+
+      if items.count < 6 {
+        if category == "all" {
+          async let r1 = self.innertubeWeb("search", payload: ["query": "nhạc trẻ việt nam hot nhất 2026 mv"])
+          async let r2 = self.innertubeWeb("search", payload: ["query": "video xu hướng việt nam mới nhất hôm nay"])
+          let (t1, t2) = await (r1, r2)
+          let l1 = self.extractVideos(from: t1, limit: 16)
+          let l2 = self.extractVideos(from: t2, limit: 16)
+          var seen = Set<String>()
+          for i in 0..<max(l1.count, l2.count) {
+            if i < l1.count, let id = l1[i]["id"] as? String, seen.insert(id).inserted { items.append(l1[i]) }
+            if i < l2.count, let id = l2[i]["id"] as? String, seen.insert(id).inserted { items.append(l2[i]) }
+          }
+        } else {
+          let q = self.categoryQueries[category] ?? category
+          let tree = await self.innertubeWeb("search", payload: ["query": q])
+          items = self.extractVideos(from: tree, limit: 30)
+        }
+      }
+
+      if !items.isEmpty {
+        let now = Date().timeIntervalSince1970
+        self.stateLock.lock()
+        self.homeCache[category] = (now + 240, items)
+        self.stateLock.unlock()
+        if category == "all" {
+          self.writeJSONFile("home_cache.json", dict: ["savedAt": now, "items": items])
+        }
+      }
+      return items
+    }
+    inflightHome[category] = task
+    stateLock.unlock()
+
+    let res = await task.value
+    stateLock.lock()
+    inflightHome.removeValue(forKey: category)
+    stateLock.unlock()
+    return res
   }
 
   private func fetchSuggestions(_ q: String) async -> [String] {
     guard !q.isEmpty,
           let enc = q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
           let url = URL(string: "https://suggestqueries-clients6.youtube.com/complete/search?client=youtube&hl=vi&gl=VN&ds=yt&q=\(enc)"),
-          let (data, _) = try? await URLSession.shared.data(from: url),
+          let (data, _) = try? await fastSession.data(from: url),
           let text = String(data: data, encoding: .utf8),
           let s = text.firstIndex(of: "("),
           let e = text.lastIndex(of: ")")
@@ -469,6 +564,62 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
     return (audioUrl, videoUrls, qualities.sorted(), sd["hlsManifestUrl"] as? String)
   }
 
+  // Ultra-fast (~180ms) stream extraction ONLY (with single-flight deduplication)
+  private func fetchPlayer(videoId: String) async -> [String: Any] {
+    let now = Date().timeIntervalSince1970
+    stateLock.lock()
+    if let hit = playerCache[videoId], hit.expires > now {
+      stateLock.unlock()
+      return hit.data
+    }
+    if let running = inflightPlayer[videoId] {
+      stateLock.unlock()
+      return await running.value
+    }
+    let task = Task<[String: Any], Never> { [weak self] in
+      guard let self else { return [:] }
+      var pData = await self.queryPlayerClient(videoId: videoId, useAndroidVR: false)
+      var parsed = self.parsePlayerStreams(pData)
+      if parsed.audioUrl.isEmpty && parsed.hls == nil {
+        let vrData = await self.queryPlayerClient(videoId: videoId, useAndroidVR: true)
+        let vrParsed = self.parsePlayerStreams(vrData)
+        if !vrParsed.audioUrl.isEmpty {
+          pData = vrData
+          parsed = vrParsed
+        }
+      }
+      let vd = pData["videoDetails"] as? [String: Any] ?? [:]
+      let out: [String: Any] = [
+        "id": videoId,
+        "title": vd["title"] as? String ?? "",
+        "channel": vd["author"] as? String ?? "YouTube",
+        "channelId": vd["channelId"] as? String ?? "",
+        "description": vd["shortDescription"] as? String ?? "",
+        "durationSeconds": Int(vd["lengthSeconds"] as? String ?? "0") ?? 0,
+        "isLive": vd["isLiveContent"] as? Bool ?? false,
+        "thumbnail": "https://i.ytimg.com/vi/\(videoId)/hqdefault.jpg",
+        "qualities": parsed.qualities,
+        "hlsUrl": parsed.hls ?? NSNull(),
+        "directAudioUrl": parsed.audioUrl,
+        "directVideoUrls": parsed.videoUrls
+      ]
+      if !parsed.audioUrl.isEmpty || parsed.hls != nil {
+        self.stateLock.lock()
+        self.playerCache[videoId] = (Date().timeIntervalSince1970 + 7200, out)
+        self.stateLock.unlock()
+      }
+      return out
+    }
+    inflightPlayer[videoId] = task
+    stateLock.unlock()
+
+    let res = await task.value
+    stateLock.lock()
+    inflightPlayer.removeValue(forKey: videoId)
+    stateLock.unlock()
+    return res
+  }
+
   private func fetchWatch(videoId: String) async -> [String: Any] {
     let now = Date().timeIntervalSince1970
     stateLock.lock()
@@ -478,34 +629,18 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
     }
     stateLock.unlock()
 
-    async let playerReq = queryPlayerClient(videoId: videoId, useAndroidVR: false)
+    async let playerReq = fetchPlayer(videoId: videoId)
     async let nextReq = innertubeWeb("next", payload: ["videoId": videoId])
     async let sponsorReq = fetchSponsorSegments(videoId)
 
-    var pData = await playerReq
-    let (nData, segs) = await (nextReq, sponsorReq)
-    var parsed = parsePlayerStreams(pData)
+    let (pOut, nData, segs) = await (playerReq, nextReq, sponsorReq)
 
-    // Automatic fallback to ANDROID_VR if IOS client restricted a specific video
-    if parsed.audioUrl.isEmpty && parsed.hls == nil {
-      let vrData = await queryPlayerClient(videoId: videoId, useAndroidVR: true)
-      let vrParsed = parsePlayerStreams(vrData)
-      if !vrParsed.audioUrl.isEmpty {
-        pData = vrData
-        parsed = vrParsed
-      }
-    }
-
-    let vd = pData["videoDetails"] as? [String: Any] ?? [:]
     let p1 = findFirstDict(in: nData, key: "videoPrimaryInfoRenderer") ?? [:]
     let p2 = findFirstDict(in: nData, key: "videoSecondaryInfoRenderer") ?? [:]
     let vc = (p1["viewCount"] as? [String: Any])?["videoViewCountRenderer"] as? [String: Any] ?? [:]
     let owner = (p2["owner"] as? [String: Any])?["videoOwnerRenderer"] as? [String: Any] ?? [:]
 
-    let title = {
-      let t = runsText(p1["title"])
-      return t.isEmpty ? (vd["title"] as? String ?? "") : t
-    }()
+    let pTitle = runsText(p1["title"])
     let views = {
       let v = runsText(vc["shortViewCount"])
       return v.isEmpty ? runsText(vc["viewCount"]) : v
@@ -514,46 +649,32 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
       let p = runsText(p1["relativeDateText"])
       return p.isEmpty ? runsText(p1["dateText"]) : p
     }()
-    let channel = {
-      let c = runsText(owner["title"])
-      return c.isEmpty ? (vd["author"] as? String ?? "YouTube") : c
-    }()
+    let ownerName = runsText(owner["title"])
     let channelId = (((owner["navigationEndpoint"] as? [String: Any])?["browseEndpoint"] as? [String: Any])?["browseId"] as? String)
-      ?? (vd["channelId"] as? String ?? "")
+      ?? (pOut["channelId"] as? String ?? "")
     let avThumbs = ((owner["thumbnail"] as? [String: Any])?["thumbnails"] as? [[String: Any]]) ?? []
     let channelAvatar = avThumbs.last?["url"] as? String ?? ""
     let subscribers = runsText(owner["subscriberCountText"])
     let desc = ((p2["attributedDescription"] as? [String: Any])?["content"] as? String)
-      ?? (vd["shortDescription"] as? String ?? "")
+      ?? (pOut["description"] as? String ?? "")
 
-    let related = extractVideos(from: nData, limit: 24).filter { ($0["id"] as? String) != videoId }
+    let related = extractVideos(from: nData, limit: 22).filter { ($0["id"] as? String) != videoId }
 
-    let out: [String: Any] = [
-      "id": videoId,
-      "title": title,
-      "channel": channel,
-      "channelId": channelId,
-      "channelAvatar": channelAvatar,
-      "subscribers": subscribers,
-      "views": views,
-      "published": published,
-      "description": desc,
-      "durationSeconds": Int(vd["lengthSeconds"] as? String ?? "0") ?? 0,
-      "isLive": vd["isLiveContent"] as? Bool ?? false,
-      "thumbnail": "https://i.ytimg.com/vi/\(videoId)/hq720.jpg",
-      "qualities": parsed.qualities,
-      "hlsUrl": parsed.hls ?? NSNull(),
-      "directAudioUrl": parsed.audioUrl,
-      "directVideoUrls": parsed.videoUrls,
-      "sponsorSegments": segs,
-      "related": related
-    ]
+    var out = pOut
+    if !pTitle.isEmpty { out["title"] = pTitle }
+    if !ownerName.isEmpty { out["channel"] = ownerName }
+    out["channelId"] = channelId
+    out["channelAvatar"] = channelAvatar
+    out["subscribers"] = subscribers
+    out["views"] = views
+    out["published"] = published
+    out["description"] = desc
+    out["sponsorSegments"] = segs
+    out["related"] = related
 
-    if !parsed.audioUrl.isEmpty || parsed.hls != nil {
-      stateLock.lock()
-      watchCache[videoId] = (now + 7200, out)
-      stateLock.unlock()
-    }
+    stateLock.lock()
+    watchCache[videoId] = (now + 7200, out)
+    stateLock.unlock()
     return out
   }
 
@@ -586,7 +707,7 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
   private func fetchSponsorSegments(_ videoId: String) async -> [[String: Any]] {
     let cats = "%5B%22sponsor%22,%22selfpromo%22,%22interaction%22,%22music_offtopic%22%5D"
     guard let url = URL(string: "https://sponsor.ajay.app/api/skipSegments?videoID=\(videoId)&categories=\(cats)"),
-          let (data, resp) = try? await URLSession.shared.data(from: url),
+          let (data, resp) = try? await sponsorSession.data(from: url),
           (resp as? HTTPURLResponse)?.statusCode == 200,
           let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
     else { return [] }
@@ -679,6 +800,7 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
     writeJSONFile("google_auth.json", dict: finalAuth)
     stateLock.lock()
     pendingDevice = [:]
+    homeCache.removeAll()
     stateLock.unlock()
     return ["status": "connected", "account": selected, "accounts": accounts]
   }
@@ -725,6 +847,18 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
       return runs.compactMap { $0["text"] as? String }.joined()
     }
     return ""
+  }
+
+  private func pickFastThumb(_ sources: [[String: Any]]?, videoId: String) -> String {
+    if let sources, !sources.isEmpty {
+      // Pick the ~320-480px thumbnail for crisp mobile cards without downloading 1280px images
+      let chosen = sources.first(where: { ($0["width"] as? Int ?? 0) >= 320 }) ?? sources.last
+      if var u = chosen?["url"] as? String, !u.isEmpty {
+        if u.hasPrefix("//") { u = "https:" + u }
+        return u
+      }
+    }
+    return "https://i.ytimg.com/vi/\(videoId)/hqdefault.jpg"
   }
 
   private func extractAccounts(from tree: Any) -> [[String: Any]] {
@@ -780,6 +914,7 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
           let channel = ownerRuns.first?["text"] as? String ?? "YouTube"
           let channelId = (((ownerRuns.first?["navigationEndpoint"] as? [String: Any])?["browseEndpoint"] as? [String: Any])?["browseId"] as? String) ?? ""
           let chThumbs = ((((vr["channelThumbnailSupportedRenderers"] as? [String: Any])?["channelThumbnailWithLinkRenderer"] as? [String: Any])?["thumbnail"] as? [String: Any])?["thumbnails"] as? [[String: Any]]) ?? []
+          let thumbs = (vr["thumbnail"] as? [String: Any])?["thumbnails"] as? [[String: Any]]
           var resumePct = 0
           if let ovs = vr["thumbnailOverlays"] as? [[String: Any]] {
             for ov in ovs {
@@ -798,7 +933,7 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
             "duration": runsText(vr["lengthText"]),
             "isLive": false,
             "resumePercent": resumePct,
-            "thumbnail": "https://i.ytimg.com/vi/\(vid)/hq720.jpg"
+            "thumbnail": pickFastThumb(thumbs, videoId: vid)
           ])
           return
         }
@@ -819,7 +954,9 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
 
           var duration = ""
           var resumePct = 0
-          if let ovs = ((lv["contentImage"] as? [String: Any])?["thumbnailViewModel"] as? [String: Any])?["overlays"] as? [[String: Any]] {
+          let thumbVM = (lv["contentImage"] as? [String: Any])?["thumbnailViewModel"] as? [String: Any]
+          let imgSources = (thumbVM?["image"] as? [String: Any])?["sources"] as? [[String: Any]]
+          if let ovs = thumbVM?["overlays"] as? [[String: Any]] {
             for ov in ovs {
               if let bot = ov["thumbnailBottomOverlayViewModel"] as? [String: Any] {
                 if let pb = (bot["progressBar"] as? [String: Any])?["thumbnailOverlayProgressBarViewModel"] as? [String: Any],
@@ -866,7 +1003,7 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
             "duration": duration,
             "isLive": duration.uppercased().contains("TRỰC TIẾP") || duration.uppercased().contains("LIVE"),
             "resumePercent": resumePct,
-            "thumbnail": "https://i.ytimg.com/vi/\(vid)/hq720.jpg"
+            "thumbnail": pickFastThumb(imgSources, videoId: vid)
           ])
           return
         }
@@ -881,7 +1018,9 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
           seen.insert(vid)
           var duration = ""
           var resumePct = 0
-          if let ovs = ((tr["header"] as? [String: Any])?["tileHeaderRenderer"] as? [String: Any])?["thumbnailOverlays"] as? [[String: Any]] {
+          let header = tr["header"] as? [String: Any]
+          let thumbs = ((header?["tileHeaderRenderer"] as? [String: Any])?["thumbnail"] as? [String: Any])?["thumbnails"] as? [[String: Any]]
+          if let ovs = (header?["tileHeaderRenderer"] as? [String: Any])?["thumbnailOverlays"] as? [[String: Any]] {
             for ov in ovs {
               if let ts = ov["thumbnailOverlayTimeStatusRenderer"] as? [String: Any] {
                 duration = runsText(ts["text"])
@@ -901,7 +1040,7 @@ final class YouTubeLocalEngine: NSObject, WKURLSchemeHandler {
             "duration": duration,
             "isLive": false,
             "resumePercent": resumePct,
-            "thumbnail": "https://i.ytimg.com/vi/\(vid)/hq720.jpg"
+            "thumbnail": pickFastThumb(thumbs, videoId: vid)
           ])
           return
         }

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'yt-personal-v4';
+const CACHE_NAME = 'yt-personal-v5';
 const SHELL = [
   '/',
   '/static/styles.css',

@@ -579,7 +579,7 @@ def extract_channels_from_tree(tree: Any, limit: int = 5) -> list[dict[str, Any]
 async def innertube_post(endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
     assert http_client is not None
     body = {**INNERTUBE_CONTEXT, **payload}
-    r = await http_client.post(f"https://www.youtube.com/youtubei/v1/{endpoint}", json=body)
+    r = await http_client.post(f"https://www.youtube.com/youtubei/v1/{endpoint}?prettyPrint=false", json=body)
     r.raise_for_status()
     return r.json()
 
@@ -1304,7 +1304,7 @@ async def innertube_auth_post(
         ctx["user"] = {"onBehalfOfUser": page_id}
 
     r = await http_client.post(
-        f"https://www.youtube.com/youtubei/v1/{endpoint}",
+        f"https://www.youtube.com/youtubei/v1/{endpoint}?prettyPrint=false",
         json={"context": ctx, **payload},
         headers={
             "Authorization": f"Bearer {tok}",

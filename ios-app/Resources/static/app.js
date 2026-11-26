@@ -108,12 +108,10 @@
 
   async function syncProfileFromServer() {
     try {
-      const [profRes, infoRes, authRes] = await Promise.all([
-        fetch('/api/profile'),
-        fetch('/api/info'),
-        fetch('/api/auth/status')
-      ]);
-      if (profRes.ok) {
+      const reqs = [fetch('/api/profile'), fetch('/api/auth/status')];
+      if (!window.__NATIVE_IOS__) reqs.push(fetch('/api/info'));
+      const [profRes, authRes, infoRes] = await Promise.all(reqs);
+      if (profRes && profRes.ok) {
         const remote = await profRes.json();
         for (const k of ['history', 'liked', 'watchLater', 'subscriptions']) {
           if (Array.isArray(remote[k]) && remote[k].length > (state.profile[k] || []).length) {
@@ -122,10 +120,10 @@
         }
         saveState(false);
       }
-      if (infoRes.ok) {
+      if (infoRes && infoRes.ok) {
         state.serverInfo = await infoRes.json();
       }
-      if (authRes.ok) {
+      if (authRes && authRes.ok) {
         state.auth = await authRes.json();
         updateAccountTopBtn();
       }
@@ -221,19 +219,20 @@
     }
 
     container.innerHTML = items
-      .map((v) => {
+      .map((v, idx) => {
         const subParts = [v.channel, v.views, v.published].filter(Boolean).join(' · ');
         const initial = (v.channel || 'Y').trim().charAt(0).toUpperCase();
         const resumePct = v.resumePercent || getResumeRatio(v.id);
+        const lazyAttr = idx < 6 ? '' : 'loading="lazy"';
         const avatarHtml = v.channelAvatar
-          ? `<img src="${esc(v.channelAvatar)}" alt="" loading="lazy" referrerpolicy="no-referrer">`
+          ? `<img src="${esc(v.channelAvatar)}" alt="" ${lazyAttr} referrerpolicy="no-referrer">`
           : esc(initial);
         const badgeCls = v.isLive ? 'duration-badge live' : 'duration-badge';
 
         return `
         <article class="video-card" data-vid="${esc(v.id)}">
           <div class="thumb-wrap">
-            <img class="thumb-img" src="${esc(v.thumbnail)}" alt="" loading="lazy" referrerpolicy="no-referrer">
+            <img class="thumb-img" src="${esc(v.thumbnail)}" alt="" ${lazyAttr} referrerpolicy="no-referrer">
             ${v.duration ? `<span class="${badgeCls}">${esc(v.duration)}</span>` : ''}
             ${resumePct ? `<div class="resume-bar" style="width:${resumePct}%"></div>` : ''}
           </div>
@@ -254,6 +253,16 @@
       const vid = card.dataset.vid;
       const item = byId.get(vid);
       if (!item) return;
+
+      if (window.__NATIVE_IOS__) {
+        card.addEventListener(
+          'touchstart',
+          () => {
+            fetch(`/api/player/${encodeURIComponent(vid)}`).catch(() => {});
+          },
+          { passive: true, once: true }
+        );
+      }
 
       card.addEventListener('click', (e) => {
         const moreBtn = e.target.closest('.card-more-btn');
@@ -508,37 +517,55 @@
     showControlsTemporarily();
     recordHistory(state.current, resumeAt);
 
-    // 4. Fetch full watch metadata & Up Next in parallel (shares backend inflight extraction)
+    // 4. Start stream immediately via /api/player (fast ~180ms) in Native iOS, while /api/watch loads Up Next & SponsorBlock in parallel
     const activeId = item.id;
+    let startedPlayback = false;
+    const applyStreamDetail = (detail) => {
+      if (!state.current || state.current.id !== activeId) return;
+      state.current = { ...state.current, ...detail };
+      if (Array.isArray(detail.qualities) && detail.qualities.length) {
+        state.qualities = detail.qualities;
+        const avail = detail.qualities.filter((q) => q <= state.quality);
+        const actualQ = avail.length ? avail[avail.length - 1] : detail.qualities[0];
+        $('quality-btn').textContent = `${actualQ}p`;
+      }
+      if (window.__NATIVE_IOS__ && !startedPlayback) {
+        startedPlayback = true;
+        masterAudio.src = detail.isLive && detail.hlsUrl ? detail.hlsUrl : streamUrl(activeId, 'audio');
+        if (resumeAt > 0) {
+          masterAudio.addEventListener(
+            'loadedmetadata',
+            () => {
+              try { masterAudio.currentTime = resumeAt; } catch (_) {}
+            },
+            { once: true }
+          );
+        }
+        masterAudio.play().catch(() => {
+          updatePlayIcons(false);
+          playerSpinner.classList.add('hidden');
+        });
+        if (!state.audioOnly && !document.hidden && !watchSheet.classList.contains('minimized')) {
+          attachAndSyncVideo(true);
+        }
+      }
+    };
+
+    if (window.__NATIVE_IOS__) {
+      fetch(`/api/player/${encodeURIComponent(activeId)}`)
+        .then((r) => (r.ok ? r.json() : Promise.reject(new Error('player failed'))))
+        .then((pDetail) => applyStreamDetail(pDetail))
+        .catch(() => {});
+    }
+
     fetch(`/api/watch/${encodeURIComponent(activeId)}`)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error('watch failed'))))
       .then((detail) => {
         if (!state.current || state.current.id !== activeId) return;
-        state.current = { ...state.current, ...detail };
-        if (Array.isArray(detail.qualities) && detail.qualities.length) {
-          state.qualities = detail.qualities;
-          const avail = detail.qualities.filter((q) => q <= state.quality);
-          const actualQ = avail.length ? avail[avail.length - 1] : detail.qualities[0];
-          $('quality-btn').textContent = `${actualQ}p`;
-        }
+        applyStreamDetail(detail);
         state.related = detail.related || [];
 
-        if (window.__NATIVE_IOS__) {
-          masterAudio.src = detail.isLive && detail.hlsUrl ? detail.hlsUrl : streamUrl(activeId, 'audio');
-          if (resumeAt > 0) {
-            masterAudio.addEventListener(
-              'loadedmetadata',
-              () => {
-                try { masterAudio.currentTime = resumeAt; } catch (_) {}
-              },
-              { once: true }
-            );
-          }
-          masterAudio.play().catch(() => {});
-          if (!state.audioOnly && !document.hidden && !watchSheet.classList.contains('minimized')) {
-            attachAndSyncVideo(true);
-          }
-        } else if (detail.isLive && detail.hlsUrl && masterAudio.error) {
+        if (!window.__NATIVE_IOS__ && detail.isLive && detail.hlsUrl && masterAudio.error) {
           masterAudio.src = detail.hlsUrl;
           masterAudio.play().catch(() => {});
         }
@@ -2125,11 +2152,15 @@
       navigator.serviceWorker.register('/sw.js').catch(() => {});
     }
 
-    ensurePinUnlocked().then(() => {
-      syncProfileFromServer().then(() => {
+    if (window.__NATIVE_IOS__) {
+      syncProfileFromServer();
+      loadHome('all');
+    } else {
+      ensurePinUnlocked().then(() => {
+        syncProfileFromServer();
         loadHome('all');
       });
-    });
+    }
   }
 
   init();

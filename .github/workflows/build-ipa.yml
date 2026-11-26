@@ -40,6 +40,15 @@ jobs:
           rm -rf Payload YouTubeCaNhan.ipa
           mkdir -p Payload
           cp -R build/Build/Products/Release-iphoneos/YouTubeCaNhan.app Payload/
+          python3 -c '
+          import os, plistlib
+          p = plistlib.loads(open("Payload/YouTubeCaNhan.app/Info.plist", "rb").read())
+          for k in ("UILaunchStoryboardName", "UILaunchScreen", "UIBackgroundModes", "UISupportedInterfaceOrientations", "NSAppTransportSecurity"):
+              assert k in p, f"Missing {k} in compiled Info.plist!"
+          assert "audio" in p["UIBackgroundModes"], "Missing audio background mode!"
+          assert os.path.exists("Payload/YouTubeCaNhan.app/LaunchScreen.storyboardc"), "Missing LaunchScreen.storyboardc!"
+          print("VERIFIED_INFO_PLIST_OK:", sorted(p.keys()))
+          '
           zip -qry YouTubeCaNhan.ipa Payload
           ls -lh YouTubeCaNhan.ipa
 

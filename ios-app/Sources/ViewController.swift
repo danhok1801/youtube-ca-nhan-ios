@@ -62,6 +62,9 @@ final class ViewController: UIViewController, WKUIDelegate, WKNavigationDelegate
 
   override func viewDidLayoutSubviews() {
     super.viewDidLayoutSubviews()
+    if webView.frame != view.bounds {
+      webView.frame = view.bounds
+    }
     pushSafeAreaInsets()
   }
 
